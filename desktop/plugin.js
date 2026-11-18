@@ -5,6 +5,8 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const ID = 'session-handoff-review'
 let context = null
 let inFlight = false
+let pending = null
+let repaint = () => {}
 
 // This is context occupancy, not the provider account's quota remaining.
 export function contextBadge(usage) {
@@ -29,15 +31,30 @@ export function suggestTitle(oldTitle, inventory) {
   return `${stem} ${number}`
 }
 
-/** A user's click requests agent preparation in the old chat; no migration is authorized here. */
+/** The button is the sole approval; the agent supplies only factual content. */
 export async function requestPreparation({ oldId, oldTitle, profile, title }) {
   requireState(oldId && host.state.focusedStoredSessionId.get() === oldId &&
     host.state.focusedSessionOwner.get()?.profile === profile, 'Old chat focus changed')
   requireState(oldTitle && /^.+\s+[1-9]\d*$/.test(title?.trim()) && title !== oldTitle, 'Invalid new title')
+  requireState(!pending && !inFlight, 'Handoff already pending')
   const runtimeId = host.state.focusedSessionId.get()
   requireState(runtimeId && !host.state.busy.get() && typeof host.composer?.submit === 'function', 'Composer unavailable')
-  const text = `Подготовь переезд из текущего Desktop-чата «${oldTitle}» (ID ${oldId}, профиль ${profile}) в «${title}». Кратко изложи только фактические и проверенные результаты, открытые вопросы и следующий шаг; не придумывай достижений. Покажи заголовок и текст передачи мне и дождись моего явного подтверждения. До подтверждения не создавай чат, не закрепляй и не открепляй ничего. После подтверждения используй prepare_desktop_handoff с точными полями и проверь новый чат, первое сообщение и закрепления. Старый чат не архивировать и не удалять.`
-  requireState(host.composer.submit(runtimeId, text) === true, 'Composer did not accept preparation request')
+  const requestId = crypto.randomUUID()
+  const owner = host.state.focusedSessionOwner.get()
+  const text = `Пользователь уже подтвердил переезд кнопкой Desktop ↗ в «${title}». Идентификатор заявки: ${requestId}. Исходный чат: «${oldTitle}», ID ${oldId}, профиль ${profile}. Составь короткую передачу: только фактически известные и проверенные результаты, открытые вопросы, следующий шаг. Не выдумывай проверок и достижений. Вызови prepare_desktop_handoff ровно один раз с old_id, old_title, profile, title, request_id и handoff. Не спрашивай дополнительного подтверждения, не предлагай копировать текст. Событие доставки не подтверждает завершение переезда; Desktop проверит новый чат и закрепления. Старый чат не архивировать и не удалять.`
+  pending = { oldId, oldTitle, profile, title, requestId, connectionId: owner.connectionId }
+  repaint()
+  try {
+    requireState(host.composer.submit(runtimeId, text) === true, 'Composer did not accept preparation request')
+  } catch (error) { pending = null; repaint(); throw error }
+}
+
+export function stopPreparation() {
+  if (!pending || pending.phase === 'writing') return false
+  pending = null
+  repaint()
+  host.notify({ kind: 'info', message: 'Подготовка остановлена. Старый чат не изменён.' })
+  return true
 }
 
 const COLORS = {
@@ -57,6 +74,11 @@ function HandoffChip() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [estimate, setEstimate] = useState(null)
+  const [, setProgressVersion] = useState(0)
+  useEffect(() => {
+    repaint = () => setProgressVersion(value => value + 1)
+    return () => { repaint = () => {} }
+  }, [])
   const badge = contextBadge(usage?.context_max > 0 && Number.isFinite(usage?.context_percent) ? usage : !busy && estimate?.id === runtimeId && estimate.owner === `${owner?.connectionId}:${owner?.profile}` ? estimate.value : null)
 
   useEffect(() => {
@@ -99,10 +121,13 @@ function HandoffChip() {
       requireState(proposal, 'No proposal')
       await requestPreparation({ ...proposal, title: title.trim() })
       setOpen(false)
+      host.notify({ kind: 'info', message: 'Начался переезд…' })
     } catch (cause) { setError(cause.message) }
   }
 
-  const tooltip = badge.label === '↗' ? 'Занятость контекста неизвестна · подготовить переезд' : `Занятость контекста: ${badge.label.slice(2)} · подготовить переезд`
+  const tooltip = badge.label === '↗' ? 'Занятость контекста неизвестна · переезд' : `Занятость контекста: ${badge.label.slice(2)} · переезд`
+  if (pending && pending.oldId === oldId) return jsx(Button, { type: 'button', variant: 'ghost', disabled: pending.phase === 'writing',
+    onClick: () => stopPreparation(), children: pending.phase === 'writing' ? 'Завершаю перенос…' : 'Начался переезд… Стоп' })
   return jsxs(Popover, { open, onOpenChange: next => void onOpen(next), children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx(Button, {
       type: 'button', variant: 'ghost', title: tooltip, 'aria-label': tooltip,
@@ -112,8 +137,8 @@ function HandoffChip() {
     jsx(PopoverContent, { align: 'end', side: 'top', sideOffset: 8,
       style: { padding: 12, width: 'min(310px, calc(100vw - 32px))' },
       children: jsxs('div', { style: { display: 'grid', gap: 8, fontSize: '0.75rem' }, children: [
-        jsx('strong', { children: 'Подготовить переезд' }),
-        jsx('div', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Агент составит короткую фактическую передачу. Переезд — только после отдельного подтверждения в чате.' }),
+        jsx('strong', { children: 'Переезд в новую сессию' }),
+        jsx('div', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Кнопка «Переезд» — единственное подтверждение. Агент подготовит фактическую передачу, затем плагин автоматически создаст и проверит новый чат.' }),
         loading ? jsx('span', { children: 'Проверяю чат…' }) : null,
         proposal ? jsx(Input, { 'aria-label': 'Название нового чата', value: title, onChange: event => setTitle(event.target.value) }) : null,
         error ? jsx('span', { role: 'alert', style: { color: 'var(--ui-red)' }, children: error }) : null,
@@ -164,9 +189,11 @@ async function pin(route, profile, id, pinned, requestId) {
   requireState(readback?.pinned === pinned, 'Pin readback mismatch')
 }
 
-export async function runHandoff({ oldId, typedOldId, oldTitle, profile, title, handoff, confirmed }) {
-  requireState(confirmed === true, 'Explicit user confirmation required')
-  requireState(typeof oldId === 'string' && typedOldId === oldId, 'Old session ID confirmation mismatch')
+export async function runHandoff({ oldId, oldTitle, profile, title, handoff, requestId }) {
+  requireState(pending && pending.requestId === requestId && pending.oldId === oldId &&
+    pending.oldTitle === oldTitle && pending.profile === profile && pending.title === title &&
+    pending.connectionId === host.state.focusedSessionOwner.get()?.connectionId,
+    'No matching approved Desktop request')
   requireState(!inFlight, 'Handoff already in progress')
   requireState(context, 'Plugin not registered')
   requireState([oldId, oldTitle, profile, title, handoff].every(s => typeof s === 'string' && !!s.trim()),
@@ -187,10 +214,15 @@ export async function runHandoff({ oldId, typedOldId, oldTitle, profile, title, 
     // Title lookup resolves hidden/canonical rows too; scope and title are mutually exclusive.
     const found = await host.requestProfile(route, 'session.list', { title })
     requireState(Array.isArray(found.sessions) && found.sessions.length === 0, 'Title collision')
+    requireState(pending?.requestId === requestId, 'Preparation stopped before write')
     const token = crypto.randomUUID()
     // Durable latch is set before the first external write. An uncertain receipt
     // cannot cause an automatic second create/submit on re-entry.
+    // The Stop gate closes before the first write; no await between these steps.
+    pending.phase = 'writing'
+    repaint()
     context.storage.set(key, { status: 'pending', title, token })
+    host.notify({ kind: 'info', message: 'Завершаю перенос…' })
     const created = await host.requestProfile(route, 'session.create', {
       profile, source: 'gui', title, request_id: token + ':create'
     })
@@ -216,12 +248,15 @@ export async function runHandoff({ oldId, typedOldId, oldTitle, profile, title, 
       'Handoff transcript not verified')
     await pin(route, profile, newId, true, token + ':pin-new')
     await host.openSession(newId, { route, awaitHydration: true, forceResume: true })
+    requireState(host.state.focusedStoredSessionId.get() === newId, 'New session is not focused')
     // Pin verified before switching old. If the old pin changed concurrently,
     // stop instead of overriding it. An already-unpinned old row needs no edit.
     old = exact(await rows(route, profile), oldId)
     requireState(old?.title === oldTitle && old.archived === false && typeof old.pinned === 'boolean', 'Old row changed')
     if (old.pinned) await pin(route, profile, oldId, false, token + ':unpin-old')
     context.storage.set(key, { status: 'completed', title, token, newId })
+    pending = null
+    repaint()
     return { newId, status: 'completed' }
   } finally { inFlight = false }
 }
@@ -229,13 +264,19 @@ export async function runHandoff({ oldId, typedOldId, oldTitle, profile, title, 
 async function fromAgentEvent(event) {
   const payload = event?.payload
   // Events are gateway-wide, never let one Desktop window migrate another chat.
-  if (payload?.confirmed !== true || payload.profile !== host.state.focusedSessionOwner.get()?.profile ||
+  if (!pending || typeof payload?.requestId !== 'string' || payload.requestId !== pending.requestId ||
+      payload.profile !== pending.profile || payload.oldId !== pending.oldId ||
+      payload.oldTitle !== pending.oldTitle || payload.title !== pending.title ||
+      payload.profile !== host.state.focusedSessionOwner.get()?.profile ||
+      pending.connectionId !== host.state.focusedSessionOwner.get()?.connectionId ||
       payload.oldId !== host.state.focusedStoredSessionId.get()) return
   try {
-    await runHandoff({ ...payload, typedOldId: payload.oldId })
-    host.notify({ kind: 'success', message: `Чат «${payload.title}» открыт` })
+    await runHandoff(payload)
+    host.notify({ kind: 'success', message: 'Вы можете продолжить работу в новой сессии' })
   } catch (error) {
-    host.notify({ kind: 'error', message: `Переезд остановлен: ${error.message}` })
+    pending = null
+    repaint()
+    host.notify({ kind: 'error', message: `Переезд остановлен: ${error.message}. Проверьте состояние нового чата и закрепления; повтор автоматически не выполняется.` })
   }
 }
 
@@ -244,7 +285,7 @@ export default {
   description: 'Explicit, confirmed Desktop session migration',
   register(ctx) {
     context = ctx
-    ctx.onDispose(() => { context = null })
+    ctx.onDispose(() => { context = null; pending = null })
     ctx.onDispose(host.onEvent('plugin.session-handoff-review.prepare', fromAgentEvent))
     ctx.register({ id: 'chip', area: 'composer.actions', order: 101, render: () => jsx(HandoffChip, {}) })
   }

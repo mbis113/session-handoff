@@ -14,25 +14,27 @@ PLUGIN_ID = 'session-handoff-review'
 def prepare_handoff(args: dict, db_path: Path = DEFAULT_DB, **kwargs) -> str:
     """Validate a confirmed proposal; event delivery itself is unacknowledged."""
     try:
-        if args.get('confirmed') is not True:
-            raise ValueError('Explicit user confirmation after the proposed title is required')
         old_id = args['old_id']
         old_title = args['old_title']
         profile = args['profile']
         title = args['title']
         handoff = args['handoff']
+        request_id = args['request_id']
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError('Missing Desktop request ID')
         plan = plan_handoff(db_path, profile, old_id, title, handoff)
         if not old_title or old_title == title:
             raise ValueError('Old and new titles must differ')
         # plan_handoff validates profile/source/archive/title collision; check exact old title.
+        from contextlib import closing
         import sqlite3
-        with sqlite3.connect(f'{Path(db_path).resolve(strict=True).as_uri()}?mode=ro', uri=True) as db:
+        with closing(sqlite3.connect(f'{Path(db_path).resolve(strict=True).as_uri()}?mode=ro', uri=True)) as db:
             actual = db.execute('SELECT title FROM sessions WHERE id=?', (old_id,)).fetchone()
         if actual is None or actual[0] != old_title:
             raise ValueError('Old session title mismatch')
         broadcast_plugin_event(PLUGIN_ID, 'prepare', {
             'oldId': old_id, 'oldTitle': old_title, 'profile': profile,
-            'title': plan['suggested_title'], 'handoff': plan['handoff'], 'confirmed': True})
+            'title': plan['suggested_title'], 'handoff': plan['handoff'], 'requestId': request_id})
         return json.dumps({'status': 'sent_unacknowledged', 'old_id': old_id,
                            'instruction': 'Check target transcript and Desktop before claiming success.'}, ensure_ascii=False)
     except (KeyError, ValueError, TypeError, OSError) as exc:
@@ -43,15 +45,15 @@ def prepare_handoff(args: dict, db_path: Path = DEFAULT_DB, **kwargs) -> str:
 
 SCHEMA = {
     'name': 'prepare_desktop_handoff',
-    'description': 'After proposing the numbered title and receiving explicit user yes IN THIS Desktop chat, send the verified handoff to the Desktop renderer. Never call for Telegram or before confirmation. Event is unacknowledged; verify outcome separately.',
+    'description': 'Emit an agent-written factual handoff for a Desktop button-approved migration. Only call in the button-triggered old chat with its exact request_id; no further chat confirmation. Delivery is unacknowledged; Desktop verifies completion.',
     'parameters': {
         'type': 'object',
         'properties': {
             'old_id': {'type': 'string'}, 'old_title': {'type': 'string'},
             'profile': {'type': 'string'}, 'title': {'type': 'string'},
-            'handoff': {'type': 'string'}, 'confirmed': {'type': 'boolean'},
+            'handoff': {'type': 'string'}, 'request_id': {'type': 'string'},
         },
-        'required': ['old_id', 'old_title', 'profile', 'title', 'handoff', 'confirmed'],
+        'required': ['old_id', 'old_title', 'profile', 'title', 'handoff', 'request_id'],
     },
 }
 
