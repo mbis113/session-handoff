@@ -1,0 +1,7 @@
+name: session-handoff-review
+version: 0.1.0
+description: "Confirmed agent-to-Desktop session migration bridge; prototype, opt-in."
+author: Local prototype
+kind: standalone
+provides_tools:
+  - prepare_desktop_handoff
