@@ -85,7 +85,7 @@ function HandoffChip() {
       const route = await routeFor(profile)
       const inventory = await rows(route, profile)
       const old = exact(inventory, expectedId)
-      requireState(old?.source === 'desktop' && old.profile_name === profile && old.archived === false, 'Focused chat is not a Desktop session')
+      requireState(old?.source === 'desktop' && old.profile === profile && old.archived === false, 'Focused chat is not a Desktop session')
       if (host.state.focusedStoredSessionId.get() !== expectedId) return
       setProposal({ oldId: expectedId, oldTitle: old.title, profile })
       setTitle(suggestTitle(old.title, inventory))
@@ -181,10 +181,11 @@ export async function runHandoff({ oldId, typedOldId, oldTitle, profile, title, 
     let list = await rows(route, profile)
     let old = exact(list, oldId)
     requireState(old?.title === oldTitle, 'Old session title mismatch')
-    requireState(old.source === 'desktop' && old.profile_name === profile && old.archived === false && typeof old.pinned === 'boolean',
+    requireState(old.source === 'desktop' && old.profile === profile && old.archived === false && typeof old.pinned === 'boolean',
       'Old session is not a verified Desktop row')
     requireState(!list.some(row => row.title === title), 'Title collision')
-    const found = await host.requestProfile(route, 'session.list', { profile, scope: 'stored', title, limit: 500 })
+    // Title lookup resolves hidden/canonical rows too; scope and title are mutually exclusive.
+    const found = await host.requestProfile(route, 'session.list', { title })
     requireState(Array.isArray(found.sessions) && found.sessions.length === 0, 'Title collision')
     const token = crypto.randomUUID()
     // Durable latch is set before the first external write. An uncertain receipt
@@ -199,7 +200,7 @@ export async function runHandoff({ oldId, typedOldId, oldTitle, profile, title, 
     context.storage.set(key, { status: 'created', title, token, newId })
     list = await rows(route, profile)
     const newRow = exact(list, newId)
-    requireState(newRow?.title === title && newRow.source === 'desktop' && newRow.profile_name === profile &&
+    requireState(newRow?.title === title && newRow.source === 'desktop' && newRow.profile === profile &&
       newRow.archived === false && !newRow.pinned && list.filter(row => row.title === title).length === 1,
       'Created session identity/readback mismatch')
     old = exact(list, oldId)
