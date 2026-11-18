@@ -1,8 +1,130 @@
-import { host } from '@hermes/plugin-sdk'
+import { Button, host, Input, Popover, PopoverContent, PopoverTrigger, useValue } from '@hermes/plugin-sdk'
+import { useEffect, useState } from 'react'
+import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-handoff-review'
 let context = null
 let inFlight = false
+
+// This is context occupancy, not the provider account's quota remaining.
+export function contextBadge(usage) {
+  const percent = usage?.context_percent
+  if (!Number.isFinite(percent) || !Number.isFinite(usage?.context_max) || usage.context_max <= 0 || percent < 0) {
+    return { label: '↗', tone: 'gray' }
+  }
+  const tone = percent < 35 ? 'gray' : percent < 40 ? 'green' : percent < 45 ? 'yellow' : 'red'
+  return { label: `↗ ${usage.context_estimated ? '≈' : ''}${Math.round(Math.min(100, percent))}%`, tone }
+}
+
+export function suggestTitle(oldTitle, inventory) {
+  const match = /^(.*?)(?:\s+[1-9]\d*)?$/.exec(oldTitle.trim())
+  const stem = match?.[1]?.trim() || 'Чат'
+  const used = new Set(inventory.map(row => row.title))
+  let number = 2
+  for (const row of inventory) {
+    const found = new RegExp(`^${stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} ([1-9]\\d*)$`).exec(row.title)
+    if (found) number = Math.max(number, Number(found[1]) + 1)
+  }
+  while (used.has(`${stem} ${number}`)) number++
+  return `${stem} ${number}`
+}
+
+/** A user's click requests agent preparation in the old chat; no migration is authorized here. */
+export async function requestPreparation({ oldId, oldTitle, profile, title }) {
+  requireState(oldId && host.state.focusedStoredSessionId.get() === oldId &&
+    host.state.focusedSessionOwner.get()?.profile === profile, 'Old chat focus changed')
+  requireState(oldTitle && /^.+\s+[1-9]\d*$/.test(title?.trim()) && title !== oldTitle, 'Invalid new title')
+  const runtimeId = host.state.focusedSessionId.get()
+  requireState(runtimeId && !host.state.busy.get() && typeof host.composer?.submit === 'function', 'Composer unavailable')
+  const text = `Подготовь переезд из текущего Desktop-чата «${oldTitle}» (ID ${oldId}, профиль ${profile}) в «${title}». Кратко изложи только фактические и проверенные результаты, открытые вопросы и следующий шаг; не придумывай достижений. Покажи заголовок и текст передачи мне и дождись моего явного подтверждения. До подтверждения не создавай чат, не закрепляй и не открепляй ничего. После подтверждения используй prepare_desktop_handoff с точными полями и проверь новый чат, первое сообщение и закрепления. Старый чат не архивировать и не удалять.`
+  requireState(host.composer.submit(runtimeId, text) === true, 'Composer did not accept preparation request')
+}
+
+const COLORS = {
+  gray: 'var(--ui-text-quaternary)', green: 'var(--ui-green)',
+  yellow: 'var(--ui-yellow)', red: 'var(--ui-red)'
+}
+
+function HandoffChip() {
+  const oldId = useValue(host.state.focusedStoredSessionId)
+  const owner = useValue(host.state.focusedSessionOwner)
+  const runtimeId = useValue(host.state.focusedSessionId)
+  const usage = useValue(host.state.focusedUsage)
+  const busy = useValue(host.state.busy)
+  const [open, setOpen] = useState(false)
+  const [proposal, setProposal] = useState(null)
+  const [title, setTitle] = useState('')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [estimate, setEstimate] = useState(null)
+  const badge = contextBadge(usage?.context_max > 0 && Number.isFinite(usage?.context_percent) ? usage : !busy && estimate?.id === runtimeId && estimate.owner === `${owner?.connectionId}:${owner?.profile}` ? estimate.value : null)
+
+  useEffect(() => {
+    let cancelled = false
+    setEstimate(null)
+    if (!runtimeId || busy || (usage?.context_max > 0 && Number.isFinite(usage?.context_percent))) return () => { cancelled = true }
+    const fetch = async () => {
+      try {
+        const route = await routeFor(owner?.profile)
+        const value = await host.requestProfile(route, 'session.context_breakdown', { session_id: runtimeId })
+        if (!cancelled && host.state.focusedSessionId.get() === runtimeId && value?.context_max > 0) setEstimate({ id: runtimeId, owner: `${owner?.connectionId}:${owner?.profile}`, value })
+      } catch { if (!cancelled) setEstimate(null) }
+    }
+    void fetch()
+    return () => { cancelled = true }
+  }, [runtimeId, busy, usage?.context_percent, usage?.context_max, owner?.connectionId, owner?.profile])
+
+  async function onOpen(next) {
+    setOpen(next)
+    if (!next) { setProposal(null); setError(''); return }
+    setProposal(null); setTitle(''); setError(''); setLoading(true)
+    const expectedId = host.state.focusedStoredSessionId.get()
+    try {
+      const profile = host.state.focusedSessionOwner.get()?.profile
+      requireState(expectedId && profile, 'No focused Desktop chat')
+      const route = await routeFor(profile)
+      const inventory = await rows(route, profile)
+      const old = exact(inventory, expectedId)
+      requireState(old?.source === 'desktop' && old.profile_name === profile && old.archived === false, 'Focused chat is not a Desktop session')
+      if (host.state.focusedStoredSessionId.get() !== expectedId) return
+      setProposal({ oldId: expectedId, oldTitle: old.title, profile })
+      setTitle(suggestTitle(old.title, inventory))
+    } catch (cause) { setError(cause.message) }
+    finally { setLoading(false) }
+  }
+
+  async function move() {
+    setError('')
+    try {
+      requireState(proposal, 'No proposal')
+      await requestPreparation({ ...proposal, title: title.trim() })
+      setOpen(false)
+    } catch (cause) { setError(cause.message) }
+  }
+
+  const tooltip = badge.label === '↗' ? 'Занятость контекста неизвестна · подготовить переезд' : `Занятость контекста: ${badge.label.slice(2)} · подготовить переезд`
+  return jsxs(Popover, { open, onOpenChange: next => void onOpen(next), children: [
+    jsx(PopoverTrigger, { asChild: true, children: jsx(Button, {
+      type: 'button', variant: 'ghost', title: tooltip, 'aria-label': tooltip,
+      className: 'h-(--composer-control-size) shrink-0 rounded-md px-2 text-xs font-normal',
+      style: { color: COLORS[badge.tone], fontVariantNumeric: 'tabular-nums' }, children: badge.label
+    }) }),
+    jsx(PopoverContent, { align: 'end', side: 'top', sideOffset: 8,
+      style: { padding: 12, width: 'min(310px, calc(100vw - 32px))' },
+      children: jsxs('div', { style: { display: 'grid', gap: 8, fontSize: '0.75rem' }, children: [
+        jsx('strong', { children: 'Подготовить переезд' }),
+        jsx('div', { style: { color: 'var(--ui-text-tertiary)' }, children: 'Агент составит короткую фактическую передачу. Переезд — только после отдельного подтверждения в чате.' }),
+        loading ? jsx('span', { children: 'Проверяю чат…' }) : null,
+        proposal ? jsx(Input, { 'aria-label': 'Название нового чата', value: title, onChange: event => setTitle(event.target.value) }) : null,
+        error ? jsx('span', { role: 'alert', style: { color: 'var(--ui-red)' }, children: error }) : null,
+        jsxs('div', { style: { display: 'flex', gap: 6, justifyContent: 'flex-end' }, children: [
+          jsx(Button, { type: 'button', variant: 'ghost', onClick: () => setOpen(false), children: 'Отмена' }),
+          jsx(Button, { type: 'button', disabled: !proposal || loading || busy, onClick: () => void move(), children: 'Переехать' })
+        ] })
+      ] })
+    })
+  ] })
+}
 
 function requireState(ok, message) { if (!ok) throw new Error(message) }
 function exact(rows, id) { return rows.find(row => row.id === id) }
@@ -123,5 +245,6 @@ export default {
     context = ctx
     ctx.onDispose(() => { context = null })
     ctx.onDispose(host.onEvent('plugin.session-handoff-review.prepare', fromAgentEvent))
+    ctx.register({ id: 'chip', area: 'composer.actions', order: 101, render: () => jsx(HandoffChip, {}) })
   }
 }
