@@ -7,6 +7,44 @@ let context = null
 let inFlight = false
 let pending = null
 let repaint = () => {}
+const PREPARE_TIMEOUT_MS = 300000
+let polling = false
+
+async function ack(request, status, newId) {
+  return context.rest(`/request/${encodeURIComponent(request.requestId)}/ack`, {
+    method: 'POST', body: { profile: request.profile, status, newId, claim: request.claim }, timeoutMs: 8000
+  })
+}
+
+export async function pollPreparation() {
+  if (!pending || pending.phase === 'writing' || pending.phase === 'claiming' || pending.phase === 'registering' || polling || !context) return
+  polling = true
+  const request = pending
+  try {
+    if (Date.now() - request.startedAt > PREPARE_TIMEOUT_MS) {
+      const item = await context.rest(`/request/${encodeURIComponent(request.requestId)}?profile=${encodeURIComponent(request.profile)}`, { timeoutMs: 8000 })
+      if (item.status === 'ready' && request === pending) { await fromAgentEvent({ payload: item }); return }
+      if (request !== pending) return
+      pending = null; repaint()
+      if (item.status === 'preparing') {
+        try { await ack(request, 'cancelled') } catch { /* uncertain; never auto-retry */ }
+      }
+      host.notify({ kind: 'error', message: 'Срок подготовки истек: передача не получена. Новый чат не создавался; проверьте статус перед повтором.' })
+      return
+    }
+    const item = await context.rest(`/request/${encodeURIComponent(request.requestId)}?profile=${encodeURIComponent(request.profile)}`, { timeoutMs: 8000 })
+    if (item.status === 'ready' && request === pending) await fromAgentEvent({ payload: item })
+    else if (['cancelled', 'failed', 'completed'].includes(item.status) && request === pending) {
+      pending = null; repaint()
+      host.notify({ kind: 'error', message: `Заявка закрыта (${item.status}); автоматический повтор запрещён. Проверьте состояние сессий.` })
+    }
+  } catch (error) {
+    if (request === pending) {
+      pending = null; repaint()
+      host.notify({ kind: 'error', message: `Не удалось проверить доставку передачи: ${error.message}. Новый чат автоматически не создаётся.` })
+    }
+  } finally { polling = false }
+}
 
 // This is context occupancy, not the provider account's quota remaining.
 export function contextBadge(usage) {
@@ -41,17 +79,32 @@ export async function requestPreparation({ oldId, oldTitle, profile, title }) {
   requireState(runtimeId && !host.state.busy.get() && typeof host.composer?.submit === 'function', 'Composer unavailable')
   const requestId = crypto.randomUUID()
   const owner = host.state.focusedSessionOwner.get()
+  requireState(owner?.connectionId, 'Missing owner connection')
   const text = `Пользователь уже подтвердил переезд кнопкой Desktop ↗ в «${title}». Идентификатор заявки: ${requestId}. Исходный чат: «${oldTitle}», ID ${oldId}, профиль ${profile}. Составь короткую передачу: только фактически известные и проверенные результаты, открытые вопросы, следующий шаг. Не выдумывай проверок и достижений. Вызови prepare_desktop_handoff ровно один раз с old_id, old_title, profile, title, request_id и handoff. Не спрашивай дополнительного подтверждения, не предлагай копировать текст. Событие доставки не подтверждает завершение переезда; Desktop проверит новый чат и закрепления. Старый чат не архивировать и не удалять.`
-  pending = { oldId, oldTitle, profile, title, requestId, connectionId: owner.connectionId }
+  pending = { oldId, oldTitle, profile, title, requestId, connectionId: owner.connectionId, startedAt: Date.now(), phase: 'registering' }
   repaint()
   try {
+    const registered = await context.rest('/request', { method: 'POST', body: { requestId, oldId, oldTitle, profile, title }, timeoutMs: 8000 })
+    requireState(registered?.status === 'preparing', 'Desktop request was not registered')
+    requireState(host.state.focusedStoredSessionId.get() === oldId &&
+      host.state.focusedSessionOwner.get()?.connectionId === owner.connectionId &&
+      host.state.focusedSessionOwner.get()?.profile === profile, 'Focused owner changed before submit')
+    requireState(pending?.requestId === requestId, 'Preparation stopped before submit')
+    pending.phase = 'preparing'
+    repaint()
     requireState(host.composer.submit(runtimeId, text) === true, 'Composer did not accept preparation request')
-  } catch (error) { pending = null; repaint(); throw error }
+  } catch (error) {
+    if (pending?.requestId === requestId) pending = null
+    try { await ack({ requestId, profile }, 'cancelled') } catch { /* unknown registration state */ }
+    repaint(); throw error
+  }
 }
 
 export function stopPreparation() {
-  if (!pending || pending.phase === 'writing') return false
+  if (!pending || pending.phase === 'writing' || pending.phase === 'claiming' || pending.phase === 'registering') return false
+  const stopped = pending
   pending = null
+  void ack(stopped, 'cancelled').catch(() => host.notify({ kind: 'error', message: 'Не удалось подтвердить остановку. Проверьте состояние заявки.' }))
   repaint()
   host.notify({ kind: 'info', message: 'Подготовка остановлена. Старый чат не изменён.' })
   return true
@@ -126,8 +179,8 @@ function HandoffChip() {
   }
 
   const tooltip = badge.label === '↗' ? 'Занятость контекста неизвестна · переезд' : `Занятость контекста: ${badge.label.slice(2)} · переезд`
-  if (pending && pending.oldId === oldId) return jsx(Button, { type: 'button', variant: 'ghost', disabled: pending.phase === 'writing',
-    onClick: () => stopPreparation(), children: pending.phase === 'writing' ? 'Завершаю перенос…' : 'Начался переезд… Стоп' })
+  if (pending && pending.oldId === oldId) return jsx(Button, { type: 'button', variant: 'ghost', disabled: pending.phase !== 'preparing',
+    onClick: () => stopPreparation(), children: ['writing', 'claiming'].includes(pending.phase) ? 'Проверяю перенос…' : pending.phase === 'registering' ? 'Регистрирую заявку…' : 'Готовлю передачу… Стоп' })
   return jsxs(Popover, { open, onOpenChange: next => void onOpen(next), children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx(Button, {
       type: 'button', variant: 'ghost', title: tooltip, 'aria-label': tooltip,
@@ -215,11 +268,13 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
     const found = await host.requestProfile(route, 'session.list', { title })
     requireState(Array.isArray(found.sessions) && found.sessions.length === 0, 'Title collision')
     requireState(pending?.requestId === requestId, 'Preparation stopped before write')
-    const token = crypto.randomUUID()
-    // Durable latch is set before the first external write. An uncertain receipt
-    // cannot cause an automatic second create/submit on re-entry.
-    // The Stop gate closes before the first write; no await between these steps.
+    pending.phase = 'claiming'
+    pending.claim = crypto.randomUUID()
+    repaint()
+    await ack(pending, 'writing')
+    requireState(pending?.requestId === requestId, 'Preparation stopped before write')
     pending.phase = 'writing'
+    const token = requestId
     repaint()
     context.storage.set(key, { status: 'pending', title, token })
     host.notify({ kind: 'info', message: 'Завершаю перенос…' })
@@ -254,6 +309,10 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
     old = exact(await rows(route, profile), oldId)
     requireState(old?.title === oldTitle && old.archived === false && typeof old.pinned === 'boolean', 'Old row changed')
     if (old.pinned) await pin(route, profile, oldId, false, token + ':unpin-old')
+    context.storage.set(key, { status: 'verified', title, token, newId })
+    await ack(pending, 'completed', newId)
+    const completion = await context.rest(`/request/${encodeURIComponent(requestId)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
+    requireState(completion.status === 'completed' && completion.newId === newId, 'Completion acknowledgement readback mismatch')
     context.storage.set(key, { status: 'completed', title, token, newId })
     pending = null
     repaint()
@@ -274,6 +333,9 @@ async function fromAgentEvent(event) {
     await runHandoff(payload)
     host.notify({ kind: 'success', message: 'Вы можете продолжить работу в новой сессии' })
   } catch (error) {
+    if (pending?.phase === 'writing' || pending?.phase === 'claiming') {
+      try { await ack(pending, 'failed') } catch { /* local latch remains */ }
+    }
     pending = null
     repaint()
     host.notify({ kind: 'error', message: `Переезд остановлен: ${error.message}. Проверьте состояние нового чата и закрепления; повтор автоматически не выполняется.` })
@@ -286,7 +348,8 @@ export default {
   register(ctx) {
     context = ctx
     ctx.onDispose(() => { context = null; pending = null })
-    ctx.onDispose(host.onEvent('plugin.session-handoff-review.prepare', fromAgentEvent))
+    ctx.onDispose(host.onEvent('plugin.session-handoff-review.prepare', () => { void pollPreparation() }))
+    ctx.setInterval(() => { void pollPreparation() }, 3000)
     ctx.register({ id: 'chip', area: 'composer.actions', order: 101, render: () => jsx(HandoffChip, {}) })
   }
 }

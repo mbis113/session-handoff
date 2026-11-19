@@ -1,6 +1,10 @@
 """Agent tool → gateway plugin event → Desktop renderer. No Hermes source edits."""
 import json
 from pathlib import Path
+try:
+    from . import intent
+except ImportError:
+    import intent
 
 from hermes_cli.plugin_events import broadcast_plugin_event
 try:
@@ -20,6 +24,9 @@ def prepare_handoff(args: dict, db_path: Path = DEFAULT_DB, **kwargs) -> str:
         title = args['title']
         handoff = args['handoff']
         request_id = args['request_id']
+        from hermes_cli.profiles import get_active_profile_name
+        if profile != (get_active_profile_name() or 'default'):
+            raise ValueError('Tool profile mismatch')
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError('Missing Desktop request ID')
         plan = plan_handoff(db_path, profile, old_id, title, handoff)
@@ -32,10 +39,15 @@ def prepare_handoff(args: dict, db_path: Path = DEFAULT_DB, **kwargs) -> str:
             actual = db.execute('SELECT title FROM sessions WHERE id=?', (old_id,)).fetchone()
         if actual is None or actual[0] != old_title:
             raise ValueError('Old session title mismatch')
-        broadcast_plugin_event(PLUGIN_ID, 'prepare', {
+        payload = {
             'oldId': old_id, 'oldTitle': old_title, 'profile': profile,
-            'title': plan['suggested_title'], 'handoff': plan['handoff'], 'requestId': request_id})
-        return json.dumps({'status': 'sent_unacknowledged', 'old_id': old_id,
+            'title': plan['suggested_title'], 'handoff': plan['handoff'], 'requestId': request_id}
+        intent.deliver(payload)
+        try:
+            broadcast_plugin_event(PLUGIN_ID, 'prepare', payload)
+        except Exception:
+            pass  # Polling is authoritative; the event is only a wake-up hint.
+        return json.dumps({'status': 'ready_unacknowledged', 'old_id': old_id,
                            'instruction': 'Check target transcript and Desktop before claiming success.'}, ensure_ascii=False)
     except (KeyError, ValueError, TypeError, OSError) as exc:
         return json.dumps({'status': 'rejected', 'error': str(exc)}, ensure_ascii=False)
@@ -45,7 +57,7 @@ def prepare_handoff(args: dict, db_path: Path = DEFAULT_DB, **kwargs) -> str:
 
 SCHEMA = {
     'name': 'prepare_desktop_handoff',
-    'description': 'Emit an agent-written factual handoff for a Desktop button-approved migration. Only call in the button-triggered old chat with its exact request_id; no further chat confirmation. Delivery is unacknowledged; Desktop verifies completion.',
+    'description': 'Store an agent-written factual handoff for a Desktop button-approved migration. Only call in the button-triggered old chat with its exact request_id; no further chat confirmation. Desktop polls and verifies completion.',
     'parameters': {
         'type': 'object',
         'properties': {

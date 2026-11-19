@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 
 async function fixture() {
-  const calls = [], events = new Map(), contributions = [], storage = new Map()
+  const calls = [], events = new Map(), contributions = [], storage = new Map(), mailbox = new Map()
   const rows = [{ id: 'old', title: 'Старый чат', source: 'desktop', profile: 'default', archived: false, pinned: true }]
   const messages = { old: [], new: [] }, revisions = { old: 0, new: 0 }
   let focused = 'old', busy = false, accepted = true, transcript = true, opened = true
@@ -36,11 +36,26 @@ async function fixture() {
     .replace(/^import .* from 'react'$/m, 'const { useState, useEffect } = globalThis.__react')
     .replace(/^import .* from 'react\/jsx-runtime'$/m, 'const { jsx, jsxs } = globalThis.__jsx')
   const mod = await import(`data:text/javascript,${encodeURIComponent(source)}#${Math.random()}`)
-  mod.default.register({ storage: { get: (k, d) => storage.get(k) ?? d, set: (k, v) => storage.set(k, v) }, register: c => contributions.push(c), onDispose() {} })
+  const rest = async (path, options = {}) => {
+    calls.push(['rest', path, options])
+    if (path === '/request' && options.method === 'POST') {
+      const body = options.body
+      if (mailbox.has(body.requestId)) throw Error('duplicate')
+      mailbox.set(body.requestId, { ...body, status: 'preparing' })
+      return { status: 'preparing' }
+    }
+    const match = /^\/request\/([^/?]+)(\/ack)?(?:\?profile=.*)?$/.exec(path)
+    if (!match) throw Error(`Unknown REST ${path}`)
+    const item = mailbox.get(decodeURIComponent(match[1]))
+    if (!item) throw Error('Unknown request')
+    if (match[2]) { if (options.body.status === 'completed' && item.rejectCompleted) throw Error('ack lost'); item.status = options.body.status; item.newId = options.body.newId; return { status: item.status } }
+    return structuredClone(item)
+  }
+  mod.default.register({ rest, setInterval: fn => { globalThis.__poll = fn; return () => {} }, storage: { get: (k, d) => storage.get(k) ?? d, set: (k, v) => storage.set(k, v) }, register: c => contributions.push(c), onDispose() {} })
   const render = () => { index = 0; return contributions[0].render().type() }
-  const fire = payload => events.get('plugin.session-handoff-review.prepare')({ payload })
+  const fire = async payload => { if (mailbox.has(payload?.requestId) && payload.oldId === 'old' && payload.profile === 'default' && payload.title === mailbox.get(payload.requestId).title) Object.assign(mailbox.get(payload.requestId), payload, { status: 'ready' }); await mod.pollPreparation() }
   const payload = () => ({ oldId: 'old', oldTitle: 'Старый чат', profile: 'default', title: 'Старый чат 2', handoff: 'Проверено: файл. Далее: тест.', requestId: calls.find(c => c[0] === 'composer.submit')?.[2].match(/Идентификатор заявки: ([a-f0-9-]+)/)?.[1] })
-  return { host, calls, rows, render, fire, payload, mod, setAccepted: v => { accepted = v }, setTranscript: v => { transcript = v }, setFocus: v => { focused = v }, setBusy: v => { busy = v }, setOpened: v => { opened = v } }
+  return { host, calls, rows, render, fire, payload, mod, mailbox, poll: () => mod.pollPreparation(), setAccepted: v => { accepted = v }, setTranscript: v => { transcript = v }, setFocus: v => { focused = v }, setBusy: v => { busy = v }, setOpened: v => { opened = v } }
 }
 
 async function approve(f) {
@@ -91,7 +106,7 @@ test('rejected composer request leaves no pending authorization', async () => {
 test('pending chip shows Stop only before write and clears on stop', async () => {
   const f = await fixture(); await approve(f)
   const chip = f.render()
-  assert.match(chip.props.children, /Начался переезд.*Стоп/)
+  assert.match(chip.props.children, /Готовлю передачу.*Стоп/)
   chip.props.onClick()
   assert.equal(f.render().type, 'Popover')
 })
@@ -151,4 +166,34 @@ test('unverified transcript keeps old pinned', async () => {
   const f = await fixture(); await approve(f); f.setTranscript(false)
   await f.fire({ ...f.payload(), confirmed: true })
   assert.equal(f.rows.find(r => r.id === 'old').pinned, true)
+})
+
+test('approved request is registered before composer submit and polling consumes durable handoff', async () => {
+  const f = await fixture(); await approve(f)
+  assert.ok(f.calls.findIndex(c => c[0] === 'rest' && c[1] === '/request') < f.calls.findIndex(c => c[0] === 'composer.submit'))
+  const p = f.payload()
+  Object.assign(f.mailbox.get(p.requestId), p, { status: 'ready' })
+  await f.poll()
+  assert.equal(f.rows.find(r => r.id === 'old').pinned, false)
+  assert.equal(f.mailbox.get(p.requestId).status, 'completed')
+})
+
+test('pending preparation times out with failure instead of indefinite spinner', async () => {
+  const f = await fixture(); await approve(f)
+  const originalNow = Date.now
+  Date.now = () => originalNow() + 400000
+  try { await f.poll() } finally { Date.now = originalNow }
+  assert.equal(f.render().type, 'Popover')
+  assert.ok(f.calls.some(c => c[0] === 'notify' && c[1].kind === 'error' && /истек|не получен/i.test(c[1].message)))
+  assert.equal(f.calls.some(c => c[0] === 'session.create'), false)
+})
+
+test('lost completion acknowledgement never reports success', async () => {
+  const f = await fixture(); await approve(f)
+  const p = f.payload()
+  Object.assign(f.mailbox.get(p.requestId), p, { status: 'ready' })
+  f.mailbox.get(p.requestId).rejectCompleted = true
+  await f.poll()
+  assert.equal(f.calls.some(c => c[0] === 'notify' && c[1].kind === 'success'), false)
+  assert.equal(f.rows.find(r => r.id === 'new').pinned, true)
 })

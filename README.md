@@ -4,12 +4,12 @@ Hermes Agent plugin prototype for moving a Desktop chat into a fresh named sessi
 
 ## Current status
 
-- Python agent tool `prepare_desktop_handoff` validates a selected old Desktop session in the server's read-only `state.db`, checks the new title, and broadcasts a gateway event after the user has approved a proposed title.
-- Desktop `↗` shows an editable numbered title. Clicking «Переезд» is the only confirmation: the agent is asked for a concise factual handoff, sends it through `prepare_desktop_handoff` with a request ID, and the Desktop half matches the currently pending approval before any write. No second chat «да» or manual paste. The UI shows «Начался переезд…» with «Стоп» while preparation/preflight is still reversible; after the write latch it shows «Завершаю перенос…». After verified migration it says «Вы можете продолжить работу в новой сессии».
-- Desktop checks the old profile/title, title collisions, creates the target, submits and reads back the handoff, pins and verifies the new chat, opens and verifies focus, then unpins the old. It never archives/deletes. On uncertain writes it does not automatically retry.
-- Agent tool broadcasts an unacknowledged event; only the renderer holding the matching in-memory approval and focused old chat can act. Stopping preparation invalidates that approval, but cannot cancel the already-running agent turn.
-- No live end-to-end migration has been tested. The agent half and Desktop half still require separate enable/install on a remote setup; this checkout is not deployed. Gateway event delivery is fire-and-forget, so a lost event can leave preparation pending; hot reload loses the in-memory approval. Cross-window/remote behavior and the factual accuracy of agent-written content still need live verification. **Do not enable for unrelated sessions.**
-- The 35/40/45% context alerts are **not implemented** by this plugin. `prototype.py` contains only read-only inventory and pure threshold decisions.
+- The agent tool validates the old Desktop row and title in read-only `state.db`, then writes a durable, profile-scoped handoff intent in plugin-data SQLite. An event is only an optional wake-up hint; the Desktop polls the authenticated `ctx.rest` plugin namespace every 3 seconds (including OAuth remotes, where plugin sockets may be unavailable).
+- Desktop `↗` presents an editable numbered title. One click registers a random request ID **before** the composer sends the agent's factual-preparation instruction. The agent tool accepts only an exact registered identity and refuses cancelled, expired or mismatched requests. A single claim owns the write phase. There is no second chat confirmation.
+- The chip distinguishes registration, factual preparation and migration verification. Preparation has a 5-minute deadline, a failure toast and no automatic retry. Desktop reads the durable handoff, verifies focused profile/old ID and title collision, creates and reads back the new session, submits and reads back its first message, pins and verifies the new chat, opens it, then unpins and verifies the old. It never archives/deletes. Completion is reported only after the server acknowledgement is read back; uncertain failures stop without repeating writes.
+- Backend plugin REST routes are mounted by Hermes under `/api/plugins/session-handoff-review` with gateway authentication and profile routing; the Desktop client uses its scoped SDK `ctx.rest`. The intent DB lives in the profile's `plugin-data/session-handoff-review/`, separate from user sessions. Both agent and Desktop halves must be separately enabled on remote setups.
+- **Not installed or exercised against a real connected Desktop.** Local pending approval remains renderer memory: hot reload/restart or window closure after registration requires manual inspection; the server does not claim migration completed merely because a tool stored the handoff. Tests with fakes do not prove live remote authentication/routing or native renderer behavior. The original lost/rejected event root cause remains unproven. Do not enable for unrelated sessions.
+- The 35/40/45% context alerts are **not implemented**; `prototype.py` contains only read-only inventory and pure threshold decisions.
 
 ## Tests
 
@@ -17,10 +17,11 @@ From this repository:
 
 ```sh
 node --test test_flow.mjs
-python -m unittest -q test_bridge
+python -m unittest -v test_bridge test_intent test_api
+hermes plugins doctor . --ci
 ```
 
-These tests exercise the real plugin modules against a fake Desktop/gateway and temporary SQLite database; they do not mutate live sessions. They do not prove live event delivery or renderer behavior. The separate development prototype's older tests assume a second confirmation and are not the acceptance tests for this flow.
+These tests exercise the plugin modules against a fake Desktop/gateway and temporary SQLite database; they do not mutate live sessions. They do not prove live remote REST authentication/routing or renderer behavior.
 
 ## Privacy / scope
 

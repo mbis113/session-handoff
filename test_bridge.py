@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import intent
 
 spec = importlib.util.spec_from_file_location('session_handoff_review', Path(__file__).with_name('__init__.py'))
 assert spec is not None and spec.loader is not None
@@ -27,9 +28,10 @@ class BridgeTest(unittest.TestCase):
         self.args = {'old_id': 'old', 'old_title': 'Старый чат', 'profile': 'default', 'title': 'Старый чат 2', 'handoff': 'Проверено: тест. Далее: работа.', 'request_id': 'abc-123'}
 
     def test_valid_agent_content_is_broadcast_with_request_id_without_second_yes(self):
-        with patch.object(bridge, 'broadcast_plugin_event') as emit:
+        with patch.object(intent, 'deliver') as deliver, patch.object(bridge, 'broadcast_plugin_event') as emit:
             result = json.loads(bridge.prepare_handoff(self.args, db_path=self.db))
-        self.assertEqual(result['status'], 'sent_unacknowledged')
+        self.assertEqual(result['status'], 'ready_unacknowledged')
+        deliver.assert_called_once()
         emit.assert_called_once()
         self.assertEqual(emit.call_args.args[2]['requestId'], 'abc-123')
         self.assertNotIn('confirmed', emit.call_args.args[2])
@@ -45,6 +47,17 @@ class BridgeTest(unittest.TestCase):
             result = json.loads(bridge.prepare_handoff({**self.args, 'old_title': 'wrong'}, db_path=self.db))
         self.assertEqual(result['status'], 'rejected')
         emit.assert_not_called()
+
+
+    def test_tool_requires_registered_desktop_intent_before_delivery(self):
+        with patch.object(intent, 'database_path', return_value=Path(self.temp.name) / 'intent.db'), patch.object(bridge, 'broadcast_plugin_event') as emit:
+            result = json.loads(bridge.prepare_handoff(self.args, db_path=self.db))
+            self.assertEqual(result['status'], 'rejected')
+            emit.assert_not_called()
+            intent.register(dict(requestId='abc-123', oldId='old', oldTitle='Старый чат', profile='default', title='Старый чат 2'))
+            result = json.loads(bridge.prepare_handoff(self.args, db_path=self.db))
+            self.assertEqual(result['status'], 'ready_unacknowledged')
+            self.assertEqual(intent.read('abc-123', 'default')['handoff'], self.args['handoff'])
 
 
 if __name__ == '__main__':
