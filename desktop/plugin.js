@@ -7,6 +7,7 @@ let context = null
 let inFlight = false
 let pending = null
 let lastStatus = null
+let retryable = false
 let repaint = () => {}
 const PREPARE_TIMEOUT_MS = 300000
 let polling = false
@@ -29,7 +30,20 @@ export async function refreshStatus() {
     const item = await context.rest(`/request/${encodeURIComponent(reference.requestId)}?profile=${encodeURIComponent(reference.profile)}`, { timeoutMs: 8000 })
     if (item.requestId !== reference.requestId || item.profile !== reference.profile) return
     lastStatus = { requestId: item.requestId, profile: item.profile, oldId: item.oldId,
+      oldTitle: item.oldTitle, title: item.title, newId: item.newId,
       status: item.status, stage: item.stage, reason: item.reason }
+    retryable = false
+    if (item.status === 'failed' && (item.stage == null || item.stage === 'claim') && !item.newId && item.oldId === focused && item.profile === owner?.profile &&
+        item.oldTitle && item.title && !context.storage.get(`handoff:${item.profile}:${item.oldId}`, null)) {
+      const route = await routeFor(item.profile)
+      const inventory = await rows(route, item.profile)
+      const old = exact(inventory, item.oldId)
+      const found = await host.requestProfile(route, 'session.list', { title: item.title })
+      retryable = old?.title === item.oldTitle && old.source === 'desktop' && old.profile === item.profile &&
+        old.archived === false && old.pinned === true && !inventory.some(row => row.title === item.title) &&
+        Array.isArray(found.sessions) && found.sessions.length === 0 &&
+        host.state.focusedStoredSessionId.get() === focused
+    }
     repaint()
   } catch { /* retain last known state */ }
 }
@@ -95,12 +109,27 @@ export async function requestPreparation({ oldId, oldTitle, profile, title }) {
   requireState(!pending && !inFlight, 'Handoff already pending')
   const runtimeId = host.state.focusedSessionId.get()
   requireState(runtimeId && !host.state.busy.get() && typeof host.composer?.submit === 'function', 'Composer unavailable')
+  const previous = context.storage.get('lastRequest', null)
+  if (lastStatus?.oldId === oldId && lastStatus.status === 'failed') {
+    requireState(retryable && previous?.requestId === lastStatus.requestId && previous.profile === profile &&
+      !context.storage.get(`handoff:${profile}:${oldId}`, null), 'Previous handoff is not proven safe to retry')
+    const route = await routeFor(profile)
+    const inventory = await rows(route, profile)
+    const old = exact(inventory, oldId)
+    const found = await host.requestProfile(route, 'session.list', { title: lastStatus.title })
+    requireState(old?.title === oldTitle && old.pinned === true && old.archived === false &&
+      !inventory.some(row => row.title === lastStatus.title) &&
+      Array.isArray(found.sessions) && found.sessions.length === 0, 'Previous handoff changed; retry blocked')
+    const previousItem = await context.rest(`/request/${encodeURIComponent(previous.requestId)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
+    requireState(previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
+      !previousItem.newId && previousItem.oldId === oldId &&
+      previousItem.oldTitle === oldTitle && previousItem.title === lastStatus.title, 'Previous request changed; retry blocked')
+  }
   const requestId = crypto.randomUUID()
   const owner = host.state.focusedSessionOwner.get()
   requireState(owner?.connectionId, 'Missing owner connection')
   const text = `Пользователь уже подтвердил переезд кнопкой Desktop ↗ в «${title}». Идентификатор заявки: ${requestId}. Исходный чат: «${oldTitle}», ID ${oldId}, профиль ${profile}. Составь короткую передачу: только фактически известные и проверенные результаты, открытые вопросы, следующий шаг. Не выдумывай проверок и достижений. Вызови prepare_desktop_handoff ровно один раз с old_id, old_title, profile, title, request_id и handoff. Не спрашивай дополнительного подтверждения, не предлагай копировать текст. Событие доставки не подтверждает завершение переезда; Desktop проверит новый чат и закрепления. Старый чат не архивировать и не удалять.`
   pending = { oldId, oldTitle, profile, title, requestId, connectionId: owner.connectionId, startedAt: Date.now(), phase: 'registering' }
-  context.storage.set('lastRequest', { requestId, profile })
   repaint()
   try {
     const registered = await context.rest('/request', { method: 'POST', body: { requestId, oldId, oldTitle, profile, title }, timeoutMs: 8000 })
@@ -112,6 +141,7 @@ export async function requestPreparation({ oldId, oldTitle, profile, title }) {
     pending.phase = 'preparing'
     repaint()
     requireState(host.composer.submit(runtimeId, text) === true, 'Composer did not accept preparation request')
+    context.storage.set('lastRequest', { requestId, profile })
   } catch (error) {
     if (pending?.requestId === requestId) pending = null
     try { await ack({ requestId, profile }, 'cancelled') } catch { /* unknown registration state */ }
@@ -180,6 +210,12 @@ function HandoffChip() {
       const inventory = await rows(route, profile)
       const old = exact(inventory, expectedId)
       requireState(old?.source === 'desktop' && old.profile === profile && old.archived === false, 'Focused chat is not a Desktop session')
+      if (lastStatus?.oldId === expectedId && lastStatus.status === 'failed') {
+        requireState(retryable && old.pinned === true && !context.storage.get(`handoff:${profile}:${expectedId}`, null), 'Previous handoff is not proven safe to retry')
+        const found = await host.requestProfile(route, 'session.list', { title: lastStatus.title })
+        requireState(!inventory.some(row => row.title === lastStatus.title) && Array.isArray(found.sessions) && found.sessions.length === 0,
+          'Previous handoff title exists; retry blocked')
+      }
       if (host.state.focusedStoredSessionId.get() !== expectedId) return
       setProposal({ oldId: expectedId, oldTitle: old.title, profile })
       setTitle(suggestTitle(old.title, inventory))
@@ -200,16 +236,16 @@ function HandoffChip() {
   const tooltip = badge.label === '↗' ? 'Занятость контекста неизвестна · переезд' : `Занятость контекста: ${badge.label.slice(2)} · переезд`
   if (pending && pending.oldId === oldId) return jsx(Button, { type: 'button', variant: 'ghost', disabled: pending.phase !== 'preparing',
     onClick: () => stopPreparation(), children: ['writing', 'claiming'].includes(pending.phase) ? 'Проверяю перенос…' : pending.phase === 'registering' ? 'Регистрирую заявку…' : 'Готовлю передачу… Стоп' })
-  if (lastStatus?.oldId === oldId && ['failed', 'writing'].includes(lastStatus.status)) return jsx(Button, {
+  if (lastStatus?.oldId === oldId && (lastStatus.status === 'writing' || (lastStatus.status === 'failed' && !retryable))) return jsx(Button, {
     type: 'button', variant: 'ghost', disabled: true,
     title: `Заявка ${lastStatus.requestId}: ${lastStatus.status} · ${lastStatus.stage ?? 'unknown'} / ${lastStatus.reason ?? 'unknown'}. Проверьте сессии; автоматического повтора нет.`,
     children: lastStatus.status === 'writing' ? 'Переезд: writing · статус не подтверждён' :
       `Переезд остановлен · ${lastStatus.stage ?? 'unknown'} / ${lastStatus.reason ?? 'unknown'}` })
   return jsxs(Popover, { open, onOpenChange: next => void onOpen(next), children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx(Button, {
-      type: 'button', variant: 'ghost', title: tooltip, 'aria-label': tooltip,
+      type: 'button', variant: 'ghost', title: retryable && lastStatus?.oldId === oldId ? `Заявка ${lastStatus.requestId} завершилась ошибкой без обнаруженного нового чата. Новая попытка требует отдельного подтверждения.` : tooltip, 'aria-label': tooltip,
       className: 'h-(--composer-control-size) shrink-0 rounded-md px-2 text-xs font-normal',
-      style: { color: COLORS[badge.tone], fontVariantNumeric: 'tabular-nums' }, children: badge.label
+      style: { color: COLORS[badge.tone], fontVariantNumeric: 'tabular-nums' }, children: retryable && lastStatus?.oldId === oldId ? 'Новая попытка' : badge.label
     }) }),
     jsx(PopoverContent, { align: 'end', side: 'top', sideOffset: 8,
       style: { padding: 12, width: 'min(310px, calc(100vw - 32px))' },
