@@ -41,6 +41,9 @@ async def get_request(request_id: str, profile: str):
 async def ack_request(request_id: str, body: dict):
     _owner(body.get('profile'))
     try:
-        return intent.ack(request_id, body['profile'], body['status'], body.get('newId'), body.get('claim'))
+        if set(body) - {'profile', 'status', 'newId', 'claim', 'stage', 'reason'}:
+            raise ValueError('Unknown acknowledgement field')
+        return intent.ack(request_id, body['profile'], body['status'], body.get('newId'), body.get('claim'),
+                          body.get('stage'), body.get('reason'))
     except (ValueError, KeyError) as exc:
         raise HTTPException(409, str(exc)) from exc

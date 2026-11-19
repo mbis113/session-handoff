@@ -2,8 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 
-async function fixture() {
-  const calls = [], events = new Map(), contributions = [], storage = new Map(), mailbox = new Map()
+async function fixture(shared = {}) {
+  const calls = [], events = new Map(), contributions = [], storage = shared.storage ?? new Map(), mailbox = shared.mailbox ?? new Map()
   const rows = [{ id: 'old', title: 'Старый чат', source: 'desktop', profile: 'default', archived: false, pinned: true }]
   const messages = { old: [], new: [] }, revisions = { old: 0, new: 0 }
   let focused = 'old', busy = false, accepted = true, transcript = true, opened = true
@@ -48,14 +48,14 @@ async function fixture() {
     if (!match) throw Error(`Unknown REST ${path}`)
     const item = mailbox.get(decodeURIComponent(match[1]))
     if (!item) throw Error('Unknown request')
-    if (match[2]) { if (options.body.status === 'completed' && item.rejectCompleted) throw Error('ack lost'); item.status = options.body.status; item.newId = options.body.newId; return { status: item.status } }
+    if (match[2]) { if (options.body.status === 'completed' && item.rejectCompleted) throw Error('ack lost'); Object.assign(item, { status: options.body.status, newId: options.body.newId, stage: options.body.stage, reason: options.body.reason }); return { status: item.status } }
     return structuredClone(item)
   }
   mod.default.register({ rest, setInterval: fn => { globalThis.__poll = fn; return () => {} }, storage: { get: (k, d) => storage.get(k) ?? d, set: (k, v) => storage.set(k, v) }, register: c => contributions.push(c), onDispose() {} })
   const render = () => { index = 0; return contributions[0].render().type() }
   const fire = async payload => { if (mailbox.has(payload?.requestId) && payload.oldId === 'old' && payload.profile === 'default' && payload.title === mailbox.get(payload.requestId).title) Object.assign(mailbox.get(payload.requestId), payload, { status: 'ready' }); await mod.pollPreparation() }
   const payload = () => ({ oldId: 'old', oldTitle: 'Старый чат', profile: 'default', title: 'Старый чат 2', handoff: 'Проверено: файл. Далее: тест.', requestId: calls.find(c => c[0] === 'composer.submit')?.[2].match(/Идентификатор заявки: ([a-f0-9-]+)/)?.[1] })
-  return { host, calls, rows, render, fire, payload, mod, mailbox, poll: () => mod.pollPreparation(), setAccepted: v => { accepted = v }, setTranscript: v => { transcript = v }, setFocus: v => { focused = v }, setBusy: v => { busy = v }, setOpened: v => { opened = v } }
+  return { host, calls, rows, render, fire, payload, mod, mailbox, storage, poll: () => mod.pollPreparation(), setAccepted: v => { accepted = v }, setTranscript: v => { transcript = v }, setFocus: v => { focused = v }, setBusy: v => { busy = v }, setOpened: v => { opened = v } }
 }
 
 async function approve(f) {
@@ -196,4 +196,39 @@ test('lost completion acknowledgement never reports success', async () => {
   await f.poll()
   assert.equal(f.calls.some(c => c[0] === 'notify' && c[1].kind === 'success'), false)
   assert.equal(f.rows.find(r => r.id === 'new').pinned, true)
+})
+
+test('failed writing ack stores bounded diagnostic and keeps status visible after reload', async () => {
+  const f = await fixture(); await approve(f); f.setOpened(false)
+  const p = f.payload()
+  await f.fire(p)
+  const item = f.mailbox.get(p.requestId)
+  assert.equal(item.status, 'failed')
+  assert.equal(item.stage, 'open')
+  assert.equal(item.reason, 'operation_failed')
+  assert.equal(JSON.stringify(item).includes('cannot open'), false)
+  assert.match(JSON.stringify(f.render()), /open.*operation_failed/)
+  const restarted = await fixture({ mailbox: f.mailbox, storage: f.storage })
+  await restarted.mod.refreshStatus()
+  assert.match(JSON.stringify(restarted.render()), /open.*operation_failed/)
+  assert.equal(restarted.calls.some(c => c[0] === 'session.create'), false)
+})
+
+test('uncertain writing status stays visible after reload without retry', async () => {
+  const f = await fixture(); await approve(f)
+  const p = f.payload()
+  Object.assign(f.mailbox.get(p.requestId), { status: 'writing' })
+  const restarted = await fixture({ mailbox: f.mailbox, storage: f.storage })
+  await restarted.mod.refreshStatus()
+  assert.match(JSON.stringify(restarted.render()), /writing/)
+  assert.equal(restarted.calls.some(c => c[0] === 'session.create'), false)
+})
+
+test('legacy local latch resolves existing failed request without new request', async () => {
+  const storage = new Map([['handoff:default:old', { token: 'legacy', status: 'created' }]])
+  const mailbox = new Map([['legacy', { requestId: 'legacy', profile: 'default', oldId: 'old', status: 'failed', stage: null, reason: null }]])
+  const f = await fixture({ storage, mailbox })
+  await f.mod.refreshStatus()
+  assert.match(JSON.stringify(f.render()), /unknown.*unknown/)
+  assert.equal(f.calls.some(c => c[0] === 'session.create' || c[0] === 'composer.submit'), false)
 })

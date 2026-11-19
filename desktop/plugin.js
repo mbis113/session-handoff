@@ -6,14 +6,32 @@ const ID = 'session-handoff-review'
 let context = null
 let inFlight = false
 let pending = null
+let lastStatus = null
 let repaint = () => {}
 const PREPARE_TIMEOUT_MS = 300000
 let polling = false
 
-async function ack(request, status, newId) {
+async function ack(request, status, newId, diagnostic = {}) {
   return context.rest(`/request/${encodeURIComponent(request.requestId)}/ack`, {
-    method: 'POST', body: { profile: request.profile, status, newId, claim: request.claim }, timeoutMs: 8000
+    method: 'POST', body: { profile: request.profile, status, newId, claim: request.claim, ...diagnostic }, timeoutMs: 8000
   })
+}
+
+export async function refreshStatus() {
+  if (!context) return
+  const focused = host.state.focusedStoredSessionId.get()
+  const owner = host.state.focusedSessionOwner.get()
+  const legacy = focused && owner?.profile && context.storage.get(`handoff:${owner.profile}:${focused}`, null)
+  const reference = context.storage.get('lastRequest', null) ??
+    (legacy?.token ? { requestId: legacy.token, profile: owner.profile } : null)
+  if (!reference?.requestId || !reference?.profile) return
+  try {
+    const item = await context.rest(`/request/${encodeURIComponent(reference.requestId)}?profile=${encodeURIComponent(reference.profile)}`, { timeoutMs: 8000 })
+    if (item.requestId !== reference.requestId || item.profile !== reference.profile) return
+    lastStatus = { requestId: item.requestId, profile: item.profile, oldId: item.oldId,
+      status: item.status, stage: item.stage, reason: item.reason }
+    repaint()
+  } catch { /* retain last known state */ }
 }
 
 export async function pollPreparation() {
@@ -25,7 +43,7 @@ export async function pollPreparation() {
       const item = await context.rest(`/request/${encodeURIComponent(request.requestId)}?profile=${encodeURIComponent(request.profile)}`, { timeoutMs: 8000 })
       if (item.status === 'ready' && request === pending) { await fromAgentEvent({ payload: item }); return }
       if (request !== pending) return
-      pending = null; repaint()
+      pending = null; await refreshStatus(); repaint()
       if (item.status === 'preparing') {
         try { await ack(request, 'cancelled') } catch { /* uncertain; never auto-retry */ }
       }
@@ -35,12 +53,12 @@ export async function pollPreparation() {
     const item = await context.rest(`/request/${encodeURIComponent(request.requestId)}?profile=${encodeURIComponent(request.profile)}`, { timeoutMs: 8000 })
     if (item.status === 'ready' && request === pending) await fromAgentEvent({ payload: item })
     else if (['cancelled', 'failed', 'completed'].includes(item.status) && request === pending) {
-      pending = null; repaint()
+      pending = null; await refreshStatus(); repaint()
       host.notify({ kind: 'error', message: `Заявка закрыта (${item.status}); автоматический повтор запрещён. Проверьте состояние сессий.` })
     }
   } catch (error) {
     if (request === pending) {
-      pending = null; repaint()
+      pending = null; await refreshStatus(); repaint()
       host.notify({ kind: 'error', message: `Не удалось проверить доставку передачи: ${error.message}. Новый чат автоматически не создаётся.` })
     }
   } finally { polling = false }
@@ -82,6 +100,7 @@ export async function requestPreparation({ oldId, oldTitle, profile, title }) {
   requireState(owner?.connectionId, 'Missing owner connection')
   const text = `Пользователь уже подтвердил переезд кнопкой Desktop ↗ в «${title}». Идентификатор заявки: ${requestId}. Исходный чат: «${oldTitle}», ID ${oldId}, профиль ${profile}. Составь короткую передачу: только фактически известные и проверенные результаты, открытые вопросы, следующий шаг. Не выдумывай проверок и достижений. Вызови prepare_desktop_handoff ровно один раз с old_id, old_title, profile, title, request_id и handoff. Не спрашивай дополнительного подтверждения, не предлагай копировать текст. Событие доставки не подтверждает завершение переезда; Desktop проверит новый чат и закрепления. Старый чат не архивировать и не удалять.`
   pending = { oldId, oldTitle, profile, title, requestId, connectionId: owner.connectionId, startedAt: Date.now(), phase: 'registering' }
+  context.storage.set('lastRequest', { requestId, profile })
   repaint()
   try {
     const registered = await context.rest('/request', { method: 'POST', body: { requestId, oldId, oldTitle, profile, title }, timeoutMs: 8000 })
@@ -181,6 +200,11 @@ function HandoffChip() {
   const tooltip = badge.label === '↗' ? 'Занятость контекста неизвестна · переезд' : `Занятость контекста: ${badge.label.slice(2)} · переезд`
   if (pending && pending.oldId === oldId) return jsx(Button, { type: 'button', variant: 'ghost', disabled: pending.phase !== 'preparing',
     onClick: () => stopPreparation(), children: ['writing', 'claiming'].includes(pending.phase) ? 'Проверяю перенос…' : pending.phase === 'registering' ? 'Регистрирую заявку…' : 'Готовлю передачу… Стоп' })
+  if (lastStatus?.oldId === oldId && ['failed', 'writing'].includes(lastStatus.status)) return jsx(Button, {
+    type: 'button', variant: 'ghost', disabled: true,
+    title: `Заявка ${lastStatus.requestId}: ${lastStatus.status} · ${lastStatus.stage ?? 'unknown'} / ${lastStatus.reason ?? 'unknown'}. Проверьте сессии; автоматического повтора нет.`,
+    children: lastStatus.status === 'writing' ? 'Переезд: writing · статус не подтверждён' :
+      `Переезд остановлен · ${lastStatus.stage ?? 'unknown'} / ${lastStatus.reason ?? 'unknown'}` })
   return jsxs(Popover, { open, onOpenChange: next => void onOpen(next), children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx(Button, {
       type: 'button', variant: 'ghost', title: tooltip, 'aria-label': tooltip,
@@ -274,6 +298,7 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
     await ack(pending, 'writing')
     requireState(pending?.requestId === requestId, 'Preparation stopped before write')
     pending.phase = 'writing'
+    pending.stage = 'create'
     const token = requestId
     repaint()
     context.storage.set(key, { status: 'pending', title, token })
@@ -285,6 +310,7 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
     requireState(newId && newId !== oldId && created.session_id && revision(created) >= 0,
       'Create receipt invalid')
     context.storage.set(key, { status: 'created', title, token, newId })
+    pending.stage = 'create_readback'
     list = await rows(route, profile)
     const newRow = exact(list, newId)
     requireState(newRow?.title === title && newRow.source === 'desktop' && newRow.profile === profile &&
@@ -292,29 +318,36 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
       'Created session identity/readback mismatch')
     old = exact(list, oldId)
     requireState(old?.title === oldTitle && old.archived === false, 'Old session changed')
+    pending.stage = 'submit'
     const receipt = await host.requestProfile(route, 'prompt.submit', {
       profile, session_id: created.session_id, text: handoff, submission_id: token + ':prompt', surface: 'gui'
     })
     requireState(receipt.admission_id === token + ':prompt' &&
       receipt.ref?.session_id === created.session_id && receipt.ref?.profile_id === profile &&
       ['queued', 'started', 'terminal'].includes(receipt.status), 'Prompt admission mismatch')
+    pending.stage = 'transcript'
     const verified = await snapshot(route, profile, newId)
     requireState(verified.messages?.some(m => m.role === 'user' && (m.text ?? m.content) === handoff),
       'Handoff transcript not verified')
+    pending.stage = 'pin_new'
     await pin(route, profile, newId, true, token + ':pin-new')
+    pending.stage = 'open'
     await host.openSession(newId, { route, awaitHydration: true, forceResume: true })
     requireState(host.state.focusedStoredSessionId.get() === newId, 'New session is not focused')
     // Pin verified before switching old. If the old pin changed concurrently,
     // stop instead of overriding it. An already-unpinned old row needs no edit.
+    pending.stage = 'unpin_old'
     old = exact(await rows(route, profile), oldId)
     requireState(old?.title === oldTitle && old.archived === false && typeof old.pinned === 'boolean', 'Old row changed')
     if (old.pinned) await pin(route, profile, oldId, false, token + ':unpin-old')
     context.storage.set(key, { status: 'verified', title, token, newId })
+    pending.stage = 'complete_ack'
     await ack(pending, 'completed', newId)
     const completion = await context.rest(`/request/${encodeURIComponent(requestId)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
     requireState(completion.status === 'completed' && completion.newId === newId, 'Completion acknowledgement readback mismatch')
     context.storage.set(key, { status: 'completed', title, token, newId })
     pending = null
+    await refreshStatus()
     repaint()
     return { newId, status: 'completed' }
   } finally { inFlight = false }
@@ -334,9 +367,12 @@ async function fromAgentEvent(event) {
     host.notify({ kind: 'success', message: 'Вы можете продолжить работу в новой сессии' })
   } catch (error) {
     if (pending?.phase === 'writing' || pending?.phase === 'claiming') {
-      try { await ack(pending, 'failed') } catch { /* local latch remains */ }
+      try { await ack(pending, 'failed', undefined, {
+        stage: pending.stage ?? (pending.phase === 'claiming' ? 'claim' : 'unknown'), reason: 'operation_failed'
+      }) } catch { /* claim or ack uncertain; no automatic retry */ }
     }
     pending = null
+    await refreshStatus()
     repaint()
     host.notify({ kind: 'error', message: `Переезд остановлен: ${error.message}. Проверьте состояние нового чата и закрепления; повтор автоматически не выполняется.` })
   }
@@ -350,6 +386,8 @@ export default {
     ctx.onDispose(() => { context = null; pending = null })
     ctx.onDispose(host.onEvent('plugin.session-handoff-review.prepare', () => { void pollPreparation() }))
     ctx.setInterval(() => { void pollPreparation() }, 3000)
+    ctx.setInterval(() => { void refreshStatus() }, 3000)
+    void refreshStatus()
     ctx.register({ id: 'chip', area: 'composer.actions', order: 101, render: () => jsx(HandoffChip, {}) })
   }
 }

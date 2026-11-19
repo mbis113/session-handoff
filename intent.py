@@ -8,6 +8,10 @@ from plugins.plugin_storage import plugin_data_dir
 
 TTL = 300
 FIELDS = ('requestId', 'oldId', 'oldTitle', 'profile', 'title')
+STAGES = frozenset(('claim', 'create', 'create_readback', 'submit', 'transcript',
+                    'pin_new', 'open', 'unpin_old', 'complete_ack', 'unknown'))
+REASONS = frozenset(('operation_failed', 'receipt_invalid', 'readback_mismatch',
+                     'state_changed', 'ack_uncertain', 'unknown'))
 
 
 def database_path():
@@ -20,6 +24,10 @@ def _db():
         request_id TEXT PRIMARY KEY, profile TEXT NOT NULL, identity TEXT NOT NULL,
         status TEXT NOT NULL, handoff TEXT, new_id TEXT, created_at REAL NOT NULL,
         claim TEXT)''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(intents)')}
+    for column in ('stage', 'reason'):
+        if column not in columns:
+            db.execute(f'ALTER TABLE intents ADD COLUMN {column} TEXT')
     return db
 
 
@@ -45,13 +53,13 @@ def register(data, now=None):
 
 def read(request_id, profile):
     with closing(_db()) as db:
-        row = db.execute('SELECT identity,status,handoff,new_id,created_at FROM intents WHERE request_id=? AND profile=?',
+        row = db.execute('SELECT identity,status,handoff,new_id,created_at,stage,reason FROM intents WHERE request_id=? AND profile=?',
                          (request_id, profile)).fetchone()
     if not row:
         return None
-    identity, status, handoff, new_id, created = row
+    identity, status, handoff, new_id, created, stage, reason = row
     return {**json.loads(identity), 'status': status, 'handoff': handoff,
-            'newId': new_id, 'createdAt': created}
+            'newId': new_id, 'createdAt': created, 'stage': stage, 'reason': reason}
 
 
 def deliver(data, now=None):
@@ -78,9 +86,14 @@ def deliver(data, now=None):
     return {'status': 'ready'}
 
 
-def ack(request_id, profile, status, new_id=None, claim=None):
+def ack(request_id, profile, status, new_id=None, claim=None, stage=None, reason=None):
     if status not in ('cancelled', 'writing', 'completed', 'failed'):
         raise ValueError('Invalid acknowledgement')
+    if status == 'failed':
+        if stage not in STAGES or reason not in REASONS:
+            raise ValueError('Invalid failure diagnostic')
+    elif stage is not None or reason is not None:
+        raise ValueError('Diagnostic only allowed on failure')
     with closing(_db()) as db:
         with db:
             row = db.execute('SELECT status,claim FROM intents WHERE request_id=? AND profile=?', (request_id, profile)).fetchone()
@@ -98,10 +111,10 @@ def ack(request_id, profile, status, new_id=None, claim=None):
                 raise ValueError('Claim owner mismatch')
             if status == 'completed' and (not isinstance(new_id, str) or not new_id.strip()):
                 raise ValueError('Completed request needs verified new ID')
-            updated = db.execute('''UPDATE intents SET status=?, new_id=?, claim=?,
+            updated = db.execute('''UPDATE intents SET status=?, new_id=?, claim=?, stage=?, reason=?,
                                     handoff=CASE WHEN ? IN ('completed','failed','cancelled') THEN NULL ELSE handoff END
                                     WHERE request_id=? AND profile=? AND status=?''',
-                                 (status, new_id, claim if status == 'writing' else owner,
+                                 (status, new_id, claim if status == 'writing' else owner, stage, reason,
                                   status, request_id, profile, current))
             if updated.rowcount != 1:
                 raise ValueError('Request state changed concurrently')
