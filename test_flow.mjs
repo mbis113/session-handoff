@@ -58,6 +58,16 @@ async function fixture(shared = {}) {
   return { host, calls, rows, render, fire, payload, mod, mailbox, storage, poll: () => mod.pollPreparation(), setAccepted: v => { accepted = v }, setTranscript: v => { transcript = v }, setFocus: v => { focused = v }, setBusy: v => { busy = v }, setOpened: v => { opened = v } }
 }
 
+function findButton(f, label) {
+  const stack = [...f.render().props.children[1].props.children.props.children]
+  while (stack.length) {
+    const node = stack.shift()
+    if (node?.type === 'Button' && node.props.children === label) return node
+    if (Array.isArray(node?.props?.children)) stack.push(...node.props.children)
+  }
+  throw new Error(`Button «${label}» not found`)
+}
+
 async function approve(f) {
   await f.render().props.onOpenChange(true)
   await new Promise(resolve => setImmediate(resolve))
@@ -65,8 +75,7 @@ async function approve(f) {
   const children = tree.props.children[1].props.children.props.children
   const input = children.find(c => c?.type === 'Input')
   input.props.onChange({ target: { value: 'Старый чат 2' } })
-  const button = f.render().props.children[1].props.children.props.children.at(-1).props.children.at(-1)
-  await button.props.onClick()
+  await findButton(f, 'Переехать').props.onClick()
 }
 
 test('one button confirmation authorizes factual preparation without asking chat approval', async () => {
@@ -261,8 +270,7 @@ test('failed retry registration preserves historical lastRequest reference', asy
   await f.render().props.onOpenChange(true)
   await new Promise(resolve => setImmediate(resolve))
   f.setAccepted(false)
-  const button = f.render().props.children[1].props.children.props.children.at(-1).props.children.at(-1)
-  await button.props.onClick()
+  await findButton(f, 'Переехать').props.onClick()
   assert.equal(f.storage.get('lastRequest').requestId, 'failed-old')
   assert.equal(f.mailbox.get('failed-old').status, 'failed')
 })
@@ -274,8 +282,7 @@ test('retry refuses title collision arising after opening before approval', asyn
   await f.mod.refreshStatus()
   await f.render().props.onOpenChange(true)
   f.rows.push({ id: 'partial', title: 'Старый чат 2', source: 'desktop', profile: 'default', archived: false, pinned: false })
-  const button = f.render().props.children[1].props.children.props.children.at(-1).props.children.at(-1)
-  await button.props.onClick()
+  await findButton(f, 'Переехать').props.onClick()
   assert.equal(f.calls.some(c => c[0] === 'composer.submit'), false)
   assert.equal(f.storage.get('lastRequest').requestId, 'failed-old')
 })
@@ -324,4 +331,132 @@ test('failed request with an unsafe latch or existing title cannot enable retry'
     assert.match(JSON.stringify(f.render()), /Переезд остановлен/)
     assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
   }
+})
+
+test('retry works without stored lastRequest when the pending latch token matches', async () => {
+  const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', stage: null, reason: null, newId: null }]])
+  const storage = new Map([['handoff:default:old', { token: 'failed-old', status: 'pending', title: 'Старый чат 2' }]])
+  const f = await fixture({ mailbox, storage })
+  await f.mod.refreshStatus()
+  assert.match(JSON.stringify(f.render()), /Новая попытка/)
+  await approve(f)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit'), true, JSON.stringify(f.calls.filter(c => c[0] === 'notify')))
+  const retry = f.payload()
+  assert.notEqual(retry.requestId, 'failed-old')
+  assert.equal(f.storage.get('lastRequest').requestId, retry.requestId)
+  await f.fire(retry)
+  assert.equal(f.calls.filter(c => c[0] === 'session.create').length, 1)
+  assert.equal(f.mailbox.get('failed-old').status, 'failed')
+})
+
+test('retry without lastRequest stays blocked when the latch title does not match', async () => {
+  const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', stage: null, reason: null, newId: null }]])
+  const storage = new Map([['handoff:default:old', { token: 'failed-old', status: 'pending', title: 'Другое 2' }]])
+  const f = await fixture({ mailbox, storage })
+  await f.mod.refreshStatus()
+  assert.match(JSON.stringify(f.render()), /Переезд остановлен/)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('update command construction targets the plugin clone via fetch and hard reset', async () => {
+  const f = await fixture()
+  const posix = f.mod.updateCommandFor(false)
+  assert.match(posix, /\$HOME\/\.hermes/)
+  assert.match(posix, /plugins\/session-handoff-review/)
+  assert.match(posix, /git fetch -q --depth 1 origin HEAD && git reset -q --hard FETCH_HEAD && git log -1 --format=%h/)
+  assert.match(posix, /exit 2$/)
+  const windows = f.mod.updateCommandFor(true)
+  assert.match(windows, /if exist "%HERMES_HOME%\\plugins\\session-handoff-review\\\.git"/)
+  assert.match(windows, /cd \/d/)
+  assert.match(windows, /exit \/b 2/)
+  for (const command of [posix, windows]) {
+    assert.match(command, /git fetch -q --depth 1 origin HEAD/)
+    assert.match(command, /git reset -q --hard FETCH_HEAD/)
+    assert.doesNotMatch(command, /git pull|git push/)
+    assert.doesNotMatch(command, /prepare_desktop_handoff|session\.create/)
+  }
+})
+
+test('update result parsing keeps a short hash or one bounded single-line reason', async () => {
+  const f = await fixture()
+  assert.deepEqual(f.mod.parseUpdateResult({ code: 0, stdout: 'abc1234\n' }), { ok: true, sha: 'abc1234', error: null })
+  assert.deepEqual(f.mod.parseUpdateResult({ code: 0, stdout: 'warning: ……\nabcdef01\n' }), { ok: true, sha: 'abcdef01', error: null })
+  assert.deepEqual(f.mod.parseUpdateResult({ code: 0, stdout: '' }), { ok: true, sha: null, error: null })
+  const failure = f.mod.parseUpdateResult({ code: 128, stdout: '', stderr: Array(10).fill('fatal: cannot lock ref\n    at Object.<anonymous> (git.js:1:1)').join('\n') })
+  assert.equal(failure.ok, false)
+  assert.equal(failure.sha, null)
+  assert.equal(failure.error.includes('\n'), false)
+  assert.ok(failure.error.length <= 160, `error too long: ${failure.error.length}`)
+  assert.match(failure.error, /fatal: cannot lock ref/)
+  assert.deepEqual(f.mod.parseUpdateResult({ stdout: '' }), { ok: false, sha: null, error: 'код выхода ?' })
+})
+
+test('popover footer update button refreshes only the server half and shows the short hash', async () => {
+  const f = await fixture()
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  const commands = []
+  const original = f.host.requestProfile
+  f.host.requestProfile = async (route, method, params, timeoutMs) => {
+    if (method === 'shell.exec') {
+      commands.push({ command: params.command, session_id: params.session_id, timeoutMs })
+      return /%COMSPEC%/.test(params.command) ? { code: 0, stdout: '%COMSPEC%' } : { code: 0, stdout: 'abc1234\n' }
+    }
+    return original(route, method, params, timeoutMs)
+  }
+  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('abc1234'); i++) await new Promise(resolve => setImmediate(resolve))
+  const updateCommands = commands.filter(c => !/%COMSPEC%/.test(c.command))
+  assert.equal(updateCommands.length, 1, JSON.stringify(commands))
+  assert.match(updateCommands[0].command, /git reset -q --hard FETCH_HEAD/)
+  assert.equal(updateCommands[0].session_id, 'runtime-old')
+  assert.equal(updateCommands[0].timeoutMs, 40000)
+  const dom = JSON.stringify(f.render())
+  assert.match(dom, /Серверная часть обновлена \(abc1234\)/)
+  assert.match(dom, /серверную \(Python\) часть/)
+  assert.match(dom, /Возможности → Плагины/)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('update command follows a detected Windows server through the COMSPEC probe', async () => {
+  const f = await fixture()
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  f.host.state.focusedSessionOwner = { get: () => ({ connectionId: 'srv', profile: 'default' }) }
+  f.host.profileRoutes = async () => [{ connectionId: 'srv', profile: 'default' }]
+  const commands = []
+  const original = f.host.requestProfile
+  f.host.requestProfile = async (route, method, params) => {
+    if (method === 'shell.exec') {
+      commands.push(params.command)
+      return /%COMSPEC%/.test(params.command) ? { code: 0, stdout: 'C:\\Windows\\system32\\cmd.exe' } : { code: 0, stdout: 'deadbee\n' }
+    }
+    return original(route, method, params)
+  }
+  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('deadbee'); i++) await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(commands, ['echo %COMSPEC%', f.mod.updateCommandFor(true)])
+  assert.match(JSON.stringify(f.render()), /Серверная часть обновлена \(deadbee\)/)
+})
+
+test('failed server update shows a bounded reason without a raw stack', async () => {
+  const f = await fixture()
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  const original = f.host.requestProfile
+  f.host.requestProfile = async (route, method, params) => {
+    if (method === 'shell.exec' && !/%COMSPEC%/.test(params.command)) {
+      return { code: 128, stdout: '', stderr: 'fatal: cannot lock ref\n    at Object.<anonymous> (git.js:1:1)\n    at process (node.js:1:1)' }
+    }
+    return original(route, method, params)
+  }
+  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('Не удалось'); i++) await new Promise(resolve => setImmediate(resolve))
+  const dom = JSON.stringify(f.render())
+  assert.match(dom, /Не удалось обновить серверную часть/)
+  assert.match(dom, /fatal: cannot lock ref/)
+  assert.doesNotMatch(dom, /at Object|at process/)
+  assert.ok(findButton(f, 'Обновить плагин на сервере'))
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
 })

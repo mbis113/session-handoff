@@ -11,6 +11,29 @@ let retryable = false
 let repaint = () => {}
 const PREPARE_TIMEOUT_MS = 300000
 let polling = false
+// «Обновить плагин на сервере» (popover footer) refreshes the SERVER (Python)
+// half only: git fetch + hard reset inside the plugin's clone on the server
+// host, run through the gateway's shell.exec RPC for the focused chat's
+// server. The Desktop renderer copy has no supported self-update API — it
+// still updates only through Возможности → Плагины. Same home walk as
+// pool-limits: the server's HERMES_HOME, the default home, the Docker one.
+// fetch + reset, not pull: history may be rewritten upstream and a plugin
+// clone holds no local edits. Plain strings, not template literals: $… here is
+// shell syntax. `&&` (not pool-limits's `&`) so a failed fetch can never
+// masquerade as a successful reset — the printed hash IS the result.
+const UPDATE_COMMAND_UNIX =
+  'for d in "$HERMES_HOME" "$HOME/.hermes" /opt/data; do p="$d/plugins/session-handoff-review"; ' +
+  'if [ -d "$p/.git" ]; then cd "$p" && git fetch -q --depth 1 origin HEAD && git reset -q --hard FETCH_HEAD && git log -1 --format=%h; exit $?; fi; done; ' +
+  'echo "session-handoff-review: plugin folder with .git not found on this server" >&2; exit 2'
+const UPDATE_COMMAND_WINDOWS =
+  '(if exist "%HERMES_HOME%\\plugins\\session-handoff-review\\.git" (cd /d "%HERMES_HOME%\\plugins\\session-handoff-review" && git fetch -q --depth 1 origin HEAD && git reset -q --hard FETCH_HEAD && git log -1 --format=%h) ' +
+  'else (if exist "%USERPROFILE%\\.hermes\\plugins\\session-handoff-review\\.git" (cd /d "%USERPROFILE%\\.hermes\\plugins\\session-handoff-review" && git fetch -q --depth 1 origin HEAD && git reset -q --hard FETCH_HEAD && git log -1 --format=%h) ' +
+  'else (echo session-handoff-review: plugin folder with .git not found on this server 1>&2 & exit /b 2)))'
+const UPDATE_TIMEOUT_MS = 40000
+const PLATFORM_PROBE_TIMEOUT_MS = 15000
+const UPDATE_HASH = /^[0-9a-f]{7,40}$/
+const IS_APP_WINDOWS = /Windows/i.test(String(globalThis.navigator?.userAgent ?? ''))
+const platformByConnection = new Map()
 
 function safePendingLatch(latch, item) {
   return !latch || (latch.status === 'pending' && !latch.newId &&
@@ -114,10 +137,18 @@ export async function requestPreparation({ oldId, oldTitle, profile, title }) {
   requireState(!pending && !inFlight, 'Handoff already pending')
   const runtimeId = host.state.focusedSessionId.get()
   requireState(runtimeId && !host.state.busy.get() && typeof host.composer?.submit === 'function', 'Composer unavailable')
-  const previous = context.storage.get('lastRequest', null)
+  const latchKey = `handoff:${profile}:${oldId}`
+  const latch = context.storage.get(latchKey, null)
+  // Older Desktop versions never wrote lastRequest; the pending latch token is
+  // the same durable reference refreshStatus already falls back to. Falling
+  // back to it here unlocks nothing new: the checks below still require
+  // retryable (which safePendingLatch proved on refresh) and a fresh
+  // server-side readback of that exact request.
+  const previous = context.storage.get('lastRequest', null) ??
+    (latch?.token ? { requestId: latch.token, profile } : null)
   if (lastStatus?.oldId === oldId && lastStatus.status === 'failed') {
     requireState(retryable && previous?.requestId === lastStatus.requestId && previous.profile === profile &&
-      safePendingLatch(context.storage.get(`handoff:${profile}:${oldId}`, null), lastStatus), 'Previous handoff is not proven safe to retry')
+      safePendingLatch(latch, lastStatus), 'Previous handoff is not proven safe to retry')
     const route = await routeFor(profile)
     const inventory = await rows(route, profile)
     const old = exact(inventory, oldId)
@@ -128,7 +159,7 @@ export async function requestPreparation({ oldId, oldTitle, profile, title }) {
     const previousItem = await context.rest(`/request/${encodeURIComponent(previous.requestId)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
     requireState(previousItem.requestId === previous.requestId && previousItem.profile === profile &&
       previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
-      !previousItem.newId && safePendingLatch(context.storage.get(`handoff:${profile}:${oldId}`, null), previousItem) && previousItem.oldId === oldId &&
+      !previousItem.newId && safePendingLatch(context.storage.get(latchKey, null), previousItem) && previousItem.oldId === oldId &&
       previousItem.oldTitle === oldTitle && previousItem.title === lastStatus.title, 'Previous request changed; retry blocked')
   }
   const requestId = crypto.randomUUID()
@@ -184,6 +215,7 @@ function HandoffChip() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [estimate, setEstimate] = useState(null)
+  const [update, setUpdate] = useState({ busy: false, message: null })
   const [, setProgressVersion] = useState(0)
   useEffect(() => {
     repaint = () => setProgressVersion(value => value + 1)
@@ -242,6 +274,21 @@ function HandoffChip() {
     } catch (cause) { setError(cause.message) }
   }
 
+  /** User-initiated refresh of the SERVER (Python) half only. The Desktop
+   *  renderer copy cannot self-update — Возможности → Плагины remains the only
+   *  supported way, and the footer says so. */
+  async function onUpdateServer() {
+    setUpdate({ busy: true, message: null })
+    try {
+      const profile = host.state.focusedSessionOwner.get()?.profile
+      requireState(profile, 'No focused Desktop chat')
+      const sha = await updateServerHalf(await routeFor(profile))
+      setUpdate({ busy: false, message: { ok: true, text: sha ? `Серверная часть обновлена (${sha}).` : 'Серверная часть обновлена.' } })
+    } catch (cause) {
+      setUpdate({ busy: false, message: { ok: false, text: `Не удалось обновить серверную часть: ${cause.message}` } })
+    }
+  }
+
   const tooltip = badge.label === '↗' ? 'Занятость контекста неизвестна · переезд' : `Занятость контекста: ${badge.label.slice(2)} · переезд`
   if (pending && pending.oldId === oldId) return jsx(Button, { type: 'button', variant: 'ghost', disabled: pending.phase !== 'preparing',
     onClick: () => stopPreparation(), children: ['writing', 'claiming'].includes(pending.phase) ? 'Проверяю перенос…' : pending.phase === 'registering' ? 'Регистрирую заявку…' : 'Готовлю передачу… Стоп' })
@@ -267,6 +314,16 @@ function HandoffChip() {
         jsxs('div', { style: { display: 'flex', gap: 6, justifyContent: 'flex-end' }, children: [
           jsx(Button, { type: 'button', variant: 'ghost', onClick: () => setOpen(false), children: 'Отмена' }),
           jsx(Button, { type: 'button', disabled: !proposal || loading || busy, onClick: () => void move(), children: 'Переехать' })
+        ] }),
+        jsxs('div', { style: { borderTop: '1px solid var(--chrome-action-hover)', display: 'grid', gap: 6, paddingTop: 8 }, children: [
+          jsx('div', { style: { color: 'var(--ui-text-quaternary)' },
+            children: 'Обновляет только серверную (Python) часть плагина на сервере этого чата. Часть Desktop обновляется через Возможности → Плагины.' }),
+          jsxs('div', { style: { alignItems: 'center', display: 'flex', gap: 6, justifyContent: 'space-between' }, children: [
+            update.message ? jsx('span', { role: 'status', style: { color: update.message.ok ? 'var(--ui-text-tertiary)' : 'var(--ui-red)' }, children: update.message.text }) : null,
+            jsx(Button, { type: 'button', variant: 'ghost', disabled: update.busy || loading || busy || Boolean(pending) || inFlight,
+              title: 'git fetch и жёсткий reset в клоне плагина на сервере: только серверная (Python) часть',
+              onClick: () => void onUpdateServer(), children: update.busy ? 'Обновляю серверную часть…' : 'Обновить плагин на сервере' })
+          ] })
         ] })
       ] })
     })
@@ -293,6 +350,52 @@ async function routeFor(profile) {
   requireState(matches.length === 1, 'Ambiguous or unavailable Desktop owner route')
   return matches[0]
 }
+
+export function updateCommandFor(isWindows) {
+  return isWindows ? UPDATE_COMMAND_WINDOWS : UPDATE_COMMAND_UNIX
+}
+
+/** shell.exec result → a short commit hash, or one bounded single-line reason. */
+export function parseUpdateResult(result) {
+  const lines = text => String(text ?? '').split('\n').map(line => line.trim()).filter(Boolean)
+  if (result?.code !== 0) {
+    const reason = lines(result?.stderr)[0] ?? lines(result?.stdout)[0] ?? `код выхода ${result?.code ?? '?'}`
+    return { ok: false, sha: null, error: reason.slice(-160) }
+  }
+  const sha = lines(result?.stdout).at(-1) ?? ''
+  return { ok: true, sha: UPDATE_HASH.test(sha) ? sha : null, error: null }
+}
+
+// Windows or not, PER TARGET SERVER — detected, not assumed. The probe runs
+// `echo %COMSPEC%` through the server's own shell: cmd.exe expands it to its
+// path (…cmd.exe), a POSIX shell echoes the literal `%COMSPEC%` back. The
+// 'local' connection's host IS this computer — known without probing; remotes
+// default to POSIX until the probe lands.
+async function detectWindowsServer(route) {
+  const id = route?.connectionId
+  if (!id || id === 'local') return IS_APP_WINDOWS
+  if (platformByConnection.has(id)) return platformByConnection.get(id)
+  try {
+    const out = String((await host.requestProfile(route, 'shell.exec', { command: 'echo %COMSPEC%' }, PLATFORM_PROBE_TIMEOUT_MS))?.stdout ?? '').trim()
+    if (/cmd\.exe/i.test(out)) { platformByConnection.set(id, true); return true }
+  } catch { /* probe failed — the POSIX default stands */ }
+  platformByConnection.set(id, false)
+  return false
+}
+
+/** Refresh the server (Python) half in its clone on the focused chat's
+ *  server. User-initiated only; reaches the same gateway as pool-limits's
+ *  update but always through the profile route this plugin already uses. */
+export async function updateServerHalf(route) {
+  requireState(route?.connectionId, 'No server route for the plugin update')
+  const params = { command: updateCommandFor(await detectWindowsServer(route)) }
+  const sessionId = host.state.focusedSessionId.get()
+  if (sessionId) params.session_id = sessionId
+  const parsed = parseUpdateResult(await host.requestProfile(route, 'shell.exec', params, UPDATE_TIMEOUT_MS))
+  if (!parsed.ok) throw new Error(parsed.error)
+  return parsed.sha
+}
+
 async function snapshot(route, profile, id) {
   const result = await host.requestProfile(route, 'session.resume', { profile, session_id: id, source: 'gui' })
   requireState(result.stored_session_id === id && result.session_id, 'Session resume identity mismatch')
