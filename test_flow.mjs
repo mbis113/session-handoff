@@ -288,11 +288,36 @@ test('failed request at or after write stage stays blocked even if title is abse
   assert.match(JSON.stringify(f.render()), /Переезд остановлен/)
 })
 
-test('failed request with a local write latch or existing title cannot enable retry', async () => {
-  for (const condition of ['latch', 'title']) {
+test('matching pending pre-create latch allows explicit retry without erasing historical audit', async () => {
+  const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', stage: null, reason: null, newId: null }]])
+  const storage = new Map([['lastRequest', { requestId: 'failed-old', profile: 'default' }],
+    ['handoff:default:old', { token: 'failed-old', status: 'pending', title: 'Старый чат 2' }]])
+  const f = await fixture({ mailbox, storage })
+  await f.mod.refreshStatus()
+  assert.match(JSON.stringify(f.render()), /Новая попытка/)
+  assert.equal(f.calls.some(c => c[0] === 'session.create' || c[0] === 'composer.submit'), false)
+  await approve(f)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit'), true, JSON.stringify(f.calls))
+  assert.equal(f.mailbox.get('failed-old').status, 'failed')
+  assert.deepEqual(f.storage.get('handoff:default:old'), { token: 'failed-old', status: 'pending', title: 'Старый чат 2' })
+  const retry = f.payload()
+  assert.notEqual(retry.requestId, 'failed-old')
+  await f.fire(retry)
+  assert.equal(f.calls.filter(c => c[0] === 'session.create').length, 1, JSON.stringify(f.calls))
+  assert.equal(f.storage.get('handoff:default:old').status, 'completed')
+  assert.equal(f.mailbox.get('failed-old').status, 'failed')
+})
+
+test('failed request with an unsafe latch or existing title cannot enable retry', async () => {
+  for (const condition of ['created', 'verified', 'completed', 'unknown', 'mismatch-token', 'mismatch-title', 'title']) {
     const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', newId: null }]])
     const storage = new Map([['lastRequest', { requestId: 'failed-old', profile: 'default' }]])
-    if (condition === 'latch') storage.set('handoff:default:old', { token: 'failed-old', status: 'pending' })
+    if (condition !== 'title') storage.set('handoff:default:old', {
+      token: condition === 'mismatch-token' ? 'other' : 'failed-old',
+      status: ['mismatch-token', 'mismatch-title'].includes(condition) ? 'pending' : condition,
+      title: condition === 'mismatch-title' ? 'Другое 2' : 'Старый чат 2'
+    })
     const f = await fixture({ mailbox, storage })
     if (condition === 'title') f.rows.push({ id: 'partial', title: 'Старый чат 2', source: 'desktop', profile: 'default', archived: false, pinned: false })
     await f.mod.refreshStatus()

@@ -12,6 +12,11 @@ let repaint = () => {}
 const PREPARE_TIMEOUT_MS = 300000
 let polling = false
 
+function safePendingLatch(latch, item) {
+  return !latch || (latch.status === 'pending' && !latch.newId &&
+    latch.token === item.requestId && latch.title === item.title)
+}
+
 async function ack(request, status, newId, diagnostic = {}) {
   return context.rest(`/request/${encodeURIComponent(request.requestId)}/ack`, {
     method: 'POST', body: { profile: request.profile, status, newId, claim: request.claim, ...diagnostic }, timeoutMs: 8000
@@ -34,7 +39,7 @@ export async function refreshStatus() {
       status: item.status, stage: item.stage, reason: item.reason }
     retryable = false
     if (item.status === 'failed' && (item.stage == null || item.stage === 'claim') && !item.newId && item.oldId === focused && item.profile === owner?.profile &&
-        item.oldTitle && item.title && !context.storage.get(`handoff:${item.profile}:${item.oldId}`, null)) {
+        item.oldTitle && item.title && safePendingLatch(context.storage.get(`handoff:${item.profile}:${item.oldId}`, null), item)) {
       const route = await routeFor(item.profile)
       const inventory = await rows(route, item.profile)
       const old = exact(inventory, item.oldId)
@@ -112,24 +117,27 @@ export async function requestPreparation({ oldId, oldTitle, profile, title }) {
   const previous = context.storage.get('lastRequest', null)
   if (lastStatus?.oldId === oldId && lastStatus.status === 'failed') {
     requireState(retryable && previous?.requestId === lastStatus.requestId && previous.profile === profile &&
-      !context.storage.get(`handoff:${profile}:${oldId}`, null), 'Previous handoff is not proven safe to retry')
+      safePendingLatch(context.storage.get(`handoff:${profile}:${oldId}`, null), lastStatus), 'Previous handoff is not proven safe to retry')
     const route = await routeFor(profile)
     const inventory = await rows(route, profile)
     const old = exact(inventory, oldId)
     const found = await host.requestProfile(route, 'session.list', { title: lastStatus.title })
-    requireState(old?.title === oldTitle && old.pinned === true && old.archived === false &&
+    requireState(old?.title === oldTitle && old.source === 'desktop' && old.profile === profile && old.pinned === true && old.archived === false &&
       !inventory.some(row => row.title === lastStatus.title) &&
       Array.isArray(found.sessions) && found.sessions.length === 0, 'Previous handoff changed; retry blocked')
     const previousItem = await context.rest(`/request/${encodeURIComponent(previous.requestId)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
-    requireState(previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
-      !previousItem.newId && previousItem.oldId === oldId &&
+    requireState(previousItem.requestId === previous.requestId && previousItem.profile === profile &&
+      previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
+      !previousItem.newId && safePendingLatch(context.storage.get(`handoff:${profile}:${oldId}`, null), previousItem) && previousItem.oldId === oldId &&
       previousItem.oldTitle === oldTitle && previousItem.title === lastStatus.title, 'Previous request changed; retry blocked')
   }
   const requestId = crypto.randomUUID()
   const owner = host.state.focusedSessionOwner.get()
   requireState(owner?.connectionId, 'Missing owner connection')
   const text = `Пользователь уже подтвердил переезд кнопкой Desktop ↗ в «${title}». Идентификатор заявки: ${requestId}. Исходный чат: «${oldTitle}», ID ${oldId}, профиль ${profile}. Составь короткую передачу: только фактически известные и проверенные результаты, открытые вопросы, следующий шаг. Не выдумывай проверок и достижений. Вызови prepare_desktop_handoff ровно один раз с old_id, old_title, profile, title, request_id и handoff. Не спрашивай дополнительного подтверждения, не предлагай копировать текст. Событие доставки не подтверждает завершение переезда; Desktop проверит новый чат и закрепления. Старый чат не архивировать и не удалять.`
-  pending = { oldId, oldTitle, profile, title, requestId, connectionId: owner.connectionId, startedAt: Date.now(), phase: 'registering' }
+  pending = { oldId, oldTitle, profile, title, requestId, connectionId: owner.connectionId,
+    retryPrevious: lastStatus?.oldId === oldId && lastStatus.status === 'failed' ? previous?.requestId : null,
+    startedAt: Date.now(), phase: 'registering' }
   repaint()
   try {
     const registered = await context.rest('/request', { method: 'POST', body: { requestId, oldId, oldTitle, profile, title }, timeoutMs: 8000 })
@@ -211,7 +219,8 @@ function HandoffChip() {
       const old = exact(inventory, expectedId)
       requireState(old?.source === 'desktop' && old.profile === profile && old.archived === false, 'Focused chat is not a Desktop session')
       if (lastStatus?.oldId === expectedId && lastStatus.status === 'failed') {
-        requireState(retryable && old.pinned === true && !context.storage.get(`handoff:${profile}:${expectedId}`, null), 'Previous handoff is not proven safe to retry')
+        requireState(retryable && lastStatus.profile === profile && old.title === lastStatus.oldTitle && old.pinned === true &&
+          safePendingLatch(context.storage.get(`handoff:${profile}:${expectedId}`, null), lastStatus), 'Previous handoff is not proven safe to retry')
         const found = await host.requestProfile(route, 'session.list', { title: lastStatus.title })
         requireState(!inventory.some(row => row.title === lastStatus.title) && Array.isArray(found.sessions) && found.sessions.length === 0,
           'Previous handoff title exists; retry blocked')
@@ -314,7 +323,12 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
   requireState(/^.+\s+[1-9]\d*$/.test(title.trim()) && title !== oldTitle, 'New title needs a numeric suffix')
   requireState(host.state.focusedStoredSessionId.get() === oldId, 'Old session is not focused')
   const key = `handoff:${profile}:${oldId}`
-  requireState(!context.storage.get(key, null), 'Previous handoff exists; inspect its status before retry')
+  const priorLatch = context.storage.get(key, null)
+  if (priorLatch) {
+    requireState(pending.retryPrevious && priorLatch.status === 'pending' && !priorLatch.newId &&
+      priorLatch.token === pending.retryPrevious && priorLatch.title === title,
+    'Previous handoff exists; inspect its status before retry')
+  }
   inFlight = true
   try {
     const route = await routeFor(profile)
@@ -327,6 +341,15 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
     // Title lookup resolves hidden/canonical rows too; scope and title are mutually exclusive.
     const found = await host.requestProfile(route, 'session.list', { title })
     requireState(Array.isArray(found.sessions) && found.sessions.length === 0, 'Title collision')
+    if (priorLatch) {
+      requireState(old.pinned === true, 'Old session pin changed; retry blocked')
+      const previousItem = await context.rest(`/request/${encodeURIComponent(pending.retryPrevious)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
+      requireState(previousItem.requestId === pending.retryPrevious && previousItem.profile === profile &&
+        previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
+        !previousItem.newId && previousItem.oldId === oldId && previousItem.oldTitle === oldTitle &&
+        previousItem.title === title && safePendingLatch(context.storage.get(key, null), previousItem),
+      'Previous request changed; retry blocked')
+    }
     requireState(pending?.requestId === requestId, 'Preparation stopped before write')
     pending.phase = 'claiming'
     pending.claim = crypto.randomUUID()
