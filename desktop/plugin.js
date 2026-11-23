@@ -35,9 +35,26 @@ const UPDATE_HASH = /^[0-9a-f]{7,40}$/
 const IS_APP_WINDOWS = /Windows/i.test(String(globalThis.navigator?.userAgent ?? ''))
 const platformByConnection = new Map()
 
-function safePendingLatch(latch, item) {
-  return !latch || (latch.status === 'pending' && !latch.newId &&
-    latch.token === item.requestId && latch.title === item.title)
+// A pre-create latch is safe alongside a retry only when it never recorded a
+// create (status pending, no newId) and refers to the request being retried.
+// Legacy builds wrote a random token instead of the server requestId, so for
+// such a latch the token proves nothing on its own; accept it only when the
+// caller has independently proven server-side that the exact request failed
+// before any write (failed, stage null/claim, no newId). created/verified/
+// completed/unknown statuses and any recorded newId still block. Title safety
+// lives with the callers: recorded titles that differ must both be absent.
+function safePendingLatch(latch, item, provenNoWrite) {
+  if (!latch) return true
+  if (latch.status !== 'pending' || latch.newId) return false
+  return latch.token === item.requestId || provenNoWrite === true
+}
+
+// Titles a failed attempt might have written: the server item's title plus the
+// local latch's. A legacy latch may record a different one — or the only
+// surviving record when the server request lost its title. Callers must prove
+// BOTH absent (rows + session.list) whenever the two differ.
+function recordedTitles(...sources) {
+  return [...new Set(sources.filter(t => typeof t === 'string' && t.trim()))]
 }
 
 async function ack(request, status, newId, diagnostic = {}) {
@@ -61,15 +78,23 @@ export async function refreshStatus() {
       oldTitle: item.oldTitle, title: item.title, newId: item.newId,
       status: item.status, stage: item.stage, reason: item.reason }
     retryable = false
-    if (item.status === 'failed' && (item.stage == null || item.stage === 'claim') && !item.newId && item.oldId === focused && item.profile === owner?.profile &&
-        item.oldTitle && item.title && safePendingLatch(context.storage.get(`handoff:${item.profile}:${item.oldId}`, null), item)) {
+    const latch = context.storage.get(`handoff:${item.profile}:${item.oldId}`, null)
+    // provenNoWrite = the server proof that this exact request died before any
+    // write; it is what lets a legacy random-token latch count as safe here.
+    const provenNoWrite = item.status === 'failed' && (item.stage == null || item.stage === 'claim') &&
+      !item.newId && item.oldId === focused && item.profile === owner?.profile &&
+      item.oldTitle && safePendingLatch(latch, item, true)
+    const titles = recordedTitles(item.title, latch?.title)
+    if (provenNoWrite && titles.length > 0) {
       const route = await routeFor(item.profile)
       const inventory = await rows(route, item.profile)
       const old = exact(inventory, item.oldId)
-      const found = await host.requestProfile(route, 'session.list', { title: item.title })
+      const listings = []
+      for (const title of titles) listings.push(await host.requestProfile(route, 'session.list', { title }))
       retryable = old?.title === item.oldTitle && old.source === 'desktop' && old.profile === item.profile &&
-        old.archived === false && old.pinned === true && !inventory.some(row => row.title === item.title) &&
-        Array.isArray(found.sessions) && found.sessions.length === 0 &&
+        old.archived === false && old.pinned === true &&
+        titles.every((title, i) => !inventory.some(row => row.title === title) &&
+          Array.isArray(listings[i].sessions) && listings[i].sessions.length === 0) &&
         host.state.focusedStoredSessionId.get() === focused
     }
     repaint()
@@ -148,18 +173,21 @@ export async function requestPreparation({ oldId, oldTitle, profile, title }) {
     (latch?.token ? { requestId: latch.token, profile } : null)
   if (lastStatus?.oldId === oldId && lastStatus.status === 'failed') {
     requireState(retryable && previous?.requestId === lastStatus.requestId && previous.profile === profile &&
-      safePendingLatch(latch, lastStatus), 'Previous handoff is not proven safe to retry')
+      safePendingLatch(latch, lastStatus, retryable), 'Previous handoff is not proven safe to retry')
     const route = await routeFor(profile)
     const inventory = await rows(route, profile)
     const old = exact(inventory, oldId)
-    const found = await host.requestProfile(route, 'session.list', { title: lastStatus.title })
+    const titles = recordedTitles(lastStatus.title, latch?.title)
+    const listings = []
+    for (const title of titles) listings.push(await host.requestProfile(route, 'session.list', { title }))
     requireState(old?.title === oldTitle && old.source === 'desktop' && old.profile === profile && old.pinned === true && old.archived === false &&
-      !inventory.some(row => row.title === lastStatus.title) &&
-      Array.isArray(found.sessions) && found.sessions.length === 0, 'Previous handoff changed; retry blocked')
+      titles.every((title, i) => !inventory.some(row => row.title === title) &&
+        Array.isArray(listings[i].sessions) && listings[i].sessions.length === 0), 'Previous handoff changed; retry blocked')
     const previousItem = await context.rest(`/request/${encodeURIComponent(previous.requestId)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
+    // The fresh readback above is itself the server-side proof a legacy latch needs.
     requireState(previousItem.requestId === previous.requestId && previousItem.profile === profile &&
       previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
-      !previousItem.newId && safePendingLatch(context.storage.get(latchKey, null), previousItem) && previousItem.oldId === oldId &&
+      !previousItem.newId && safePendingLatch(context.storage.get(latchKey, null), previousItem, true) && previousItem.oldId === oldId &&
       previousItem.oldTitle === oldTitle && previousItem.title === lastStatus.title, 'Previous request changed; retry blocked')
   }
   const requestId = crypto.randomUUID()
@@ -251,11 +279,14 @@ function HandoffChip() {
       const old = exact(inventory, expectedId)
       requireState(old?.source === 'desktop' && old.profile === profile && old.archived === false, 'Focused chat is not a Desktop session')
       if (lastStatus?.oldId === expectedId && lastStatus.status === 'failed') {
+        const latch = context.storage.get(`handoff:${profile}:${expectedId}`, null)
         requireState(retryable && lastStatus.profile === profile && old.title === lastStatus.oldTitle && old.pinned === true &&
-          safePendingLatch(context.storage.get(`handoff:${profile}:${expectedId}`, null), lastStatus), 'Previous handoff is not proven safe to retry')
-        const found = await host.requestProfile(route, 'session.list', { title: lastStatus.title })
-        requireState(!inventory.some(row => row.title === lastStatus.title) && Array.isArray(found.sessions) && found.sessions.length === 0,
-          'Previous handoff title exists; retry blocked')
+          safePendingLatch(latch, lastStatus, retryable), 'Previous handoff is not proven safe to retry')
+        for (const title of recordedTitles(lastStatus.title, latch?.title)) {
+          const found = await host.requestProfile(route, 'session.list', { title })
+          requireState(!inventory.some(row => row.title === title) && Array.isArray(found.sessions) && found.sessions.length === 0,
+            'Previous handoff title exists; retry blocked')
+        }
       }
       if (host.state.focusedStoredSessionId.get() !== expectedId) return
       setProposal({ oldId: expectedId, oldTitle: old.title, profile })
@@ -428,8 +459,9 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
   const key = `handoff:${profile}:${oldId}`
   const priorLatch = context.storage.get(key, null)
   if (priorLatch) {
-    requireState(pending.retryPrevious && priorLatch.status === 'pending' && !priorLatch.newId &&
-      priorLatch.token === pending.retryPrevious && priorLatch.title === title,
+    // Token equality is re-checked against the server readback below; a legacy
+    // latch carries a random token, so here only the never-created shape gates.
+    requireState(pending.retryPrevious && priorLatch.status === 'pending' && !priorLatch.newId,
     'Previous handoff exists; inspect its status before retry')
   }
   inFlight = true
@@ -446,11 +478,19 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
     requireState(Array.isArray(found.sessions) && found.sessions.length === 0, 'Title collision')
     if (priorLatch) {
       requireState(old.pinned === true, 'Old session pin changed; retry blocked')
+      // A legacy latch may record a different (or the only surviving) intended
+      // title; when it differs from the typed one it must be absent too.
+      if (priorLatch.title && priorLatch.title !== title) {
+        const found = await host.requestProfile(route, 'session.list', { title: priorLatch.title })
+        requireState(!list.some(row => row.title === priorLatch.title) && Array.isArray(found.sessions) && found.sessions.length === 0,
+          'Previous handoff title exists; retry blocked')
+      }
       const previousItem = await context.rest(`/request/${encodeURIComponent(pending.retryPrevious)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
+      // The fresh readback above is itself the server-side proof a legacy latch needs.
       requireState(previousItem.requestId === pending.retryPrevious && previousItem.profile === profile &&
         previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
-        !previousItem.newId && previousItem.oldId === oldId && previousItem.oldTitle === oldTitle &&
-        previousItem.title === title && safePendingLatch(context.storage.get(key, null), previousItem),
+        !previousItem.newId && safePendingLatch(context.storage.get(key, null), previousItem, true) && previousItem.oldId === oldId &&
+        previousItem.oldTitle === oldTitle && (!previousItem.title || previousItem.title === title),
       'Previous request changed; retry blocked')
     }
     requireState(pending?.requestId === requestId, 'Preparation stopped before write')

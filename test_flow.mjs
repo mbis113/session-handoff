@@ -316,14 +316,15 @@ test('matching pending pre-create latch allows explicit retry without erasing hi
   assert.equal(f.mailbox.get('failed-old').status, 'failed')
 })
 
-test('failed request with an unsafe latch or existing title cannot enable retry', async () => {
-  for (const condition of ['created', 'verified', 'completed', 'unknown', 'mismatch-token', 'mismatch-title', 'title']) {
-    const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', newId: null }]])
+test('failed request with an unsafe latch or existing recorded title cannot enable retry', async () => {
+  for (const condition of ['created', 'verified', 'completed', 'unknown', 'newId', 'legacy-created', 'title']) {
+    const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', stage: null, reason: null, newId: null }]])
     const storage = new Map([['lastRequest', { requestId: 'failed-old', profile: 'default' }]])
     if (condition !== 'title') storage.set('handoff:default:old', {
-      token: condition === 'mismatch-token' ? 'other' : 'failed-old',
-      status: ['mismatch-token', 'mismatch-title'].includes(condition) ? 'pending' : condition,
-      title: condition === 'mismatch-title' ? 'Другое 2' : 'Старый чат 2'
+      token: condition === 'legacy-created' ? 'other' : 'failed-old',
+      status: condition === 'newId' ? 'pending' : condition,
+      title: 'Старый чат 2',
+      ...(condition === 'newId' ? { newId: 'new' } : {})
     })
     const f = await fixture({ mailbox, storage })
     if (condition === 'title') f.rows.push({ id: 'partial', title: 'Старый чат 2', source: 'desktop', profile: 'default', archived: false, pinned: false })
@@ -350,13 +351,68 @@ test('retry works without stored lastRequest when the pending latch token matche
   assert.equal(f.mailbox.get('failed-old').status, 'failed')
 })
 
-test('retry without lastRequest stays blocked when the latch title does not match', async () => {
+test('retry without lastRequest stays blocked when a recorded title exists', async () => {
   const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', stage: null, reason: null, newId: null }]])
   const storage = new Map([['handoff:default:old', { token: 'failed-old', status: 'pending', title: 'Другое 2' }]])
   const f = await fixture({ mailbox, storage })
+  f.rows.push({ id: 'other', title: 'Другое 2', source: 'desktop', profile: 'default', archived: false, pinned: false })
   await f.mod.refreshStatus()
   assert.match(JSON.stringify(f.render()), /Переезд остановлен/)
   assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('differing server and latch titles allow retry when both are absent', async () => {
+  const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', stage: null, reason: null, newId: null }]])
+  const storage = new Map([['lastRequest', { requestId: 'failed-old', profile: 'default' }],
+    ['handoff:default:old', { token: 'failed-old', status: 'pending', title: 'Другое 2' }]])
+  const f = await fixture({ mailbox, storage })
+  await f.mod.refreshStatus()
+  assert.match(JSON.stringify(f.render()), /Новая попытка/)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('legacy random-token pending latch retries after server-proven no-write failure', async () => {
+  const legacyToken = crypto.randomUUID()
+  const failed = 'db5c1d9e-6c2a-45fb-9f3a-4aa1f3d3f62b'
+  // Server intent lost its title (legacy request), latch token was written by
+  // an old build as a random UUID — nothing ties it to `failed` except the
+  // server-side proof that this exact request failed before any write.
+  const mailbox = new Map([[failed, { requestId: failed, profile: 'default', oldId: 'old', oldTitle: 'Старый чат', status: 'failed', stage: null, reason: null, newId: null }]])
+  const storage = new Map([['lastRequest', { requestId: failed, profile: 'default' }],
+    ['handoff:default:old', { token: legacyToken, status: 'pending', title: '1212121212 2' }]])
+  const f = await fixture({ mailbox, storage })
+  await f.mod.refreshStatus()
+  assert.match(JSON.stringify(f.render()), /Новая попытка/)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+  await approve(f)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit'), true, JSON.stringify(f.calls.filter(c => c[0] === 'notify')))
+  assert.equal(f.mailbox.get(failed).status, 'failed')
+  assert.deepEqual(f.storage.get('handoff:default:old'), { token: legacyToken, status: 'pending', title: '1212121212 2' })
+  const retry = f.payload()
+  assert.notEqual(retry.requestId, failed)
+  await f.fire(retry)
+  assert.equal(f.calls.filter(c => c[0] === 'session.create').length, 1)
+  assert.equal(f.storage.get('handoff:default:old').status, 'completed')
+  assert.equal(f.mailbox.get(failed).status, 'failed')
+})
+
+test('legacy latch with a recorded title that now exists blocks the explicit retry', async () => {
+  const legacyToken = crypto.randomUUID()
+  const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', status: 'failed', stage: null, reason: null, newId: null }]])
+  const storage = new Map([['lastRequest', { requestId: 'failed-old', profile: 'default' }],
+    ['handoff:default:old', { token: legacyToken, status: 'pending', title: 'Другое 2' }]])
+  const f = await fixture({ mailbox, storage })
+  await f.mod.refreshStatus()
+  assert.match(JSON.stringify(f.render()), /Новая попытка/)
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  f.rows.push({ id: 'partial', title: 'Другое 2', source: 'desktop', profile: 'default', archived: false, pinned: false })
+  await findButton(f, 'Переехать').props.onClick()
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+  assert.equal(f.mailbox.get('failed-old').status, 'failed')
+  assert.equal(f.storage.get('lastRequest').requestId, 'failed-old')
+  assert.deepEqual(f.storage.get('handoff:default:old'), { token: legacyToken, status: 'pending', title: 'Другое 2' })
 })
 
 test('update command construction targets the plugin clone via fetch and hard reset', async () => {
