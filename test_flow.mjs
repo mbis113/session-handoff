@@ -466,7 +466,7 @@ test('popover footer update button refreshes only the server half and shows the 
   const updateCommands = commands.filter(c => !/%COMSPEC%/.test(c.command))
   assert.equal(updateCommands.length, 1, JSON.stringify(commands))
   assert.match(updateCommands[0].command, /git reset -q --hard FETCH_HEAD/)
-  assert.equal(updateCommands[0].session_id, 'runtime-old')
+  assert.equal(updateCommands[0].session_id, undefined)
   assert.equal(updateCommands[0].timeoutMs, 40000)
   const dom = JSON.stringify(f.render())
   assert.match(dom, /Серверная часть обновлена \(abc1234\)/)
@@ -514,5 +514,71 @@ test('failed server update shows a bounded reason without a raw stack', async ()
   assert.match(dom, /fatal: cannot lock ref/)
   assert.doesNotMatch(dom, /at Object|at process/)
   assert.ok(findButton(f, 'Обновить плагин на сервере'))
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('gateway that rejects an extra session_id still updates via the command alone', async () => {
+  const f = await fixture()
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  const attempts = []
+  const original = f.host.requestProfile
+  f.host.requestProfile = async (route, method, params, timeoutMs) => {
+    if (method === 'shell.exec' && !/%COMSPEC%/.test(params.command)) {
+      attempts.push({ session_id: params.session_id, timeoutMs })
+      if (params.session_id != null) throw Error('invalid params for shell.exec: session_id: Extra inputs are not permitted')
+      return { code: 0, stdout: 'abc1234\n' }
+    }
+    return original(route, method, params, timeoutMs)
+  }
+  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('abc1234'); i++) await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(attempts, [{ session_id: undefined, timeoutMs: 40000 }])
+  assert.match(JSON.stringify(f.render()), /Серверная часть обновлена \(abc1234\)/)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('gateway that requires session_id gets the focused runtime id on the bounded retry', async () => {
+  const f = await fixture()
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  const attempts = []
+  const original = f.host.requestProfile
+  f.host.requestProfile = async (route, method, params, timeoutMs) => {
+    if (method === 'shell.exec' && !/%COMSPEC%/.test(params.command)) {
+      attempts.push(params.session_id ?? null)
+      if (params.session_id == null) throw Error('invalid params for shell.exec: session_id: Field required')
+      return { code: 0, stdout: 'deadbee\n' }
+    }
+    return original(route, method, params, timeoutMs)
+  }
+  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('deadbee'); i++) await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(attempts, [null, 'runtime-old'])
+  assert.match(JSON.stringify(f.render()), /Серверная часть обновлена \(deadbee\)/)
+})
+
+test('session_id adaptation stays bounded at three attempts with one honest line', async () => {
+  const f = await fixture()
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  let attempts = 0
+  const original = f.host.requestProfile
+  f.host.requestProfile = async (route, method, params) => {
+    if (method === 'shell.exec' && !/%COMSPEC%/.test(params.command)) {
+      attempts++
+      const why = params.session_id != null ? 'Extra inputs are not permitted' : 'Field required'
+      throw Error(`invalid params for shell.exec: session_id: ${why}`)
+    }
+    return original(route, method, params)
+  }
+  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('Не удалось'); i++) await new Promise(resolve => setImmediate(resolve))
+  assert.equal(attempts, 3)
+  const dom = JSON.stringify(f.render())
+  assert.match(dom, /Не удалось обновить серверную часть/)
+  assert.match(dom, /invalid params for shell\.exec: session_id: Field required/)
+  assert.doesNotMatch(dom, /at Object|at process|at async/)
+  assert.equal(dom.includes('\\n'), false)
   assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
 })

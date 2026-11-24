@@ -414,17 +414,46 @@ async function detectWindowsServer(route) {
   return false
 }
 
+// Gateway shell.exec params differ: THIS gateway rejects an extra session_id
+// outright ('invalid params for shell.exec: session_id: Extra inputs are not
+// permitted'), others require it. Unlike pool-limits's updateParams, send
+// {command} alone first, then adapt only when the gateway's own error text
+// names session_id: drop it if rejected as extra, add the focused runtime id
+// (host.state.focusedSessionId.get()) if demanded. One flip per direction,
+// three attempts total; nothing else is retried. With no focused chat there
+// is nothing honest to send, so the gateway's error stands.
+const SESSION_ID_EXTRA = /session_id.{0,120}(extra inputs|not permitted|unexpected|unrecognized|unknown field|additional property)/i
+const SESSION_ID_REQUIRED = /session_id.{0,120}(field required|required|missing|must be)/i
+
 /** Refresh the server (Python) half in its clone on the focused chat's
  *  server. User-initiated only; reaches the same gateway as pool-limits's
  *  update but always through the profile route this plugin already uses. */
 export async function updateServerHalf(route) {
   requireState(route?.connectionId, 'No server route for the plugin update')
-  const params = { command: updateCommandFor(await detectWindowsServer(route)) }
-  const sessionId = host.state.focusedSessionId.get()
-  if (sessionId) params.session_id = sessionId
-  const parsed = parseUpdateResult(await host.requestProfile(route, 'shell.exec', params, UPDATE_TIMEOUT_MS))
-  if (!parsed.ok) throw new Error(parsed.error)
-  return parsed.sha
+  const command = updateCommandFor(await detectWindowsServer(route))
+  let withSessionId = false
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const params = { command }
+    if (withSessionId) {
+      const sessionId = host.state.focusedSessionId.get()
+      requireState(sessionId, 'Gateway needs session_id but no chat is focused')
+      params.session_id = sessionId
+    }
+    let result = null
+    let thrown = null
+    try {
+      result = await host.requestProfile(route, 'shell.exec', params, UPDATE_TIMEOUT_MS)
+    } catch (error) { thrown = error }
+    const parsed = thrown
+      ? { ok: false, sha: null, error: (String(thrown?.message ?? thrown ?? '').split('\n').map(line => line.trim()).filter(Boolean)[0] ?? '').slice(-160) }
+      : parseUpdateResult(result)
+    if (parsed.ok) return parsed.sha
+    if (attempt < 3) {
+      if (withSessionId && SESSION_ID_EXTRA.test(parsed.error)) { withSessionId = false; continue }
+      if (!withSessionId && SESSION_ID_REQUIRED.test(parsed.error)) { withSessionId = true; continue }
+    }
+    throw new Error(parsed.error)
+  }
 }
 
 async function snapshot(route, profile, id) {
