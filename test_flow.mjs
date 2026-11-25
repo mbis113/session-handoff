@@ -373,7 +373,7 @@ test('differing server and latch titles allow retry when both are absent', async
 
 test('legacy random-token pending latch retries after server-proven no-write failure', async () => {
   const legacyToken = crypto.randomUUID()
-  const failed = 'db5c1d9e-6c2a-45fb-9f3a-4aa1f3d3f62b'
+  const failed = '00000000-0000-4000-8000-000000000001'
   // Server intent lost its title (legacy request), latch token was written by
   // an old build as a random UUID — nothing ties it to `failed` except the
   // server-side proof that this exact request failed before any write.
