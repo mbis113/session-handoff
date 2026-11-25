@@ -702,6 +702,31 @@ test('requestPreparation gate names unproven retry when retryable is false', asy
   assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
 })
 
+// In-flight refresh cycle: refreshStatus must not publish a transient
+// retryable=false across its async awaits — the gate read and the chip render
+// run on the same ticks as the refresh (3s cycle), so the previous proven
+// verdict stays authoritative until the cycle assigns a fresh one.
+test('in-flight refresh retains retryable=true; gate passes and chip stays on Новая попытка mid-cycle', async () => {
+  const f = await retryableFixture()
+  let release
+  const parked = new Promise(resolve => { release = resolve })
+  const requestProfile = f.host.requestProfile
+  let parkedOnce = false
+  f.host.requestProfile = async (route, method, p) => {
+    if (method === 'session.list' && !parkedOnce) { parkedOnce = true; await parked }
+    return requestProfile(route, method, p)
+  }
+  const cycle = f.mod.refreshStatus()
+  await tick(); await tick()
+  const midCycle = JSON.stringify(f.render())
+  assert.equal(midCycle.includes('Переезд остановлен'), false, 'chip flickered to the failed badge mid-cycle')
+  assert.ok(midCycle.includes('Новая попытка'), 'chip lost the retry affordance mid-cycle')
+  await f.mod.requestPreparation({ oldId: 'old', oldTitle: 'Старый чат', profile: 'default', title: 'Старый чат 2' })
+  assert.ok(f.calls.some(c => c[0] === 'composer.submit'), 'retry click did not reach the composer mid-cycle')
+  release()
+  await cycle
+})
+
 test('requestPreparation gate names reference mismatch when lastRequest drifted', async () => {
   const f = await retryableFixture()
   f.storage.set('lastRequest', { requestId: 'other', profile: 'default' })

@@ -91,7 +91,13 @@ export async function refreshStatus() {
     lastStatus = { requestId: item.requestId, profile: item.profile, oldId: item.oldId,
       oldTitle: item.oldTitle, title: item.title, newId: item.newId,
       status: item.status, stage: item.stage, reason: item.reason }
-    retryable = false
+    // The verdict is computed into a local and assigned to the module flag once
+    // at the end of the cycle. Resetting the flag up front would publish a
+    // transient false across the awaits below: a click or a render in that
+    // window sees the last proven verdict as lost (gate refuses, chip flickers
+    // to the failed badge). A cycle that throws keeps the previous value via
+    // the catch below, so a new assignment happens only on a full pass.
+    let nextRetryable = false
     const latch = context.storage.get(`handoff:${item.profile}:${item.oldId}`, null)
     // provenNoWrite = the server proof that this exact request died before any
     // write; it is what lets a legacy random-token latch count as safe here.
@@ -105,12 +111,13 @@ export async function refreshStatus() {
       const old = exact(inventory, item.oldId)
       const listings = []
       for (const title of titles) listings.push(await host.requestProfile(route, 'session.list', { title }))
-      retryable = old?.title === item.oldTitle && old.source === 'desktop' && old.profile === item.profile &&
+      nextRetryable = old?.title === item.oldTitle && old.source === 'desktop' && old.profile === item.profile &&
         old.archived === false && old.pinned === true &&
         titles.every((title, i) => !inventory.some(row => row.title === title) &&
           Array.isArray(listings[i].sessions) && listings[i].sessions.length === 0) &&
         host.state.focusedStoredSessionId.get() === focused
     }
+    retryable = nextRetryable
     repaint()
   } catch { /* retain last known state */ }
 }
