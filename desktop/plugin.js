@@ -11,12 +11,14 @@ let retryable = false
 let repaint = () => {}
 const PREPARE_TIMEOUT_MS = 300000
 let polling = false
-// «Обновить плагин на сервере» (popover footer) refreshes the SERVER (Python)
-// half only: git fetch + hard reset inside the plugin's clone on the server
-// host, run through the gateway's shell.exec RPC for the focused chat's
+// «Обновить» (left side of the popover actions row) refreshes the SERVER
+// (Python) half only: git fetch + hard reset inside the plugin's clone on the
+// server host, run through the gateway's shell.exec RPC for the focused chat's
 // server. The Desktop renderer copy has no supported self-update API — it
-// still updates only through Возможности → Плагины. Same home walk as
-// pool-limits: the server's HERMES_HOME, the default home, the Docker one.
+// still updates only through Возможности → Плагины. Success is silent; a
+// failure shows as one bounded line in the popover's red error area. Same
+// home walk as pool-limits: the server's HERMES_HOME, the default home, the
+// Docker one.
 // fetch + reset, not pull: history may be rewritten upstream and a plugin
 // clone holds no local edits. Plain strings, not template literals: $… here is
 // shell syntax. `&&` (not pool-limits's `&`) so a failed fetch can never
@@ -55,6 +57,18 @@ function safePendingLatch(latch, item, provenNoWrite) {
 // BOTH absent (rows + session.list) whenever the two differ.
 function recordedTitles(...sources) {
   return [...new Set(sources.filter(t => typeof t === 'string' && t.trim()))]
+}
+
+// Retry-gate diagnostics: one short bounded Russian line per failed check.
+// No stack traces, URLs, request ids or titles — only which check failed.
+const RETRY_BLOCKED = {
+  retryable: 'Повтор заблокирован: проверка повторяемости не прошла',
+  reference: 'Повтор заблокирован: проверка ссылки на заявку не прошла',
+  latchStatus: 'Повтор заблокирован: проверка локальной записи не прошла',
+  latchTitle: 'Повтор заблокирован: проверка записанного названия не прошла',
+  readback: 'Повтор заблокирован: проверка данных сервера не прошла',
+  oldRow: 'Повтор заблокирован: проверка старого чата не прошла',
+  oldPin: 'Повтор заблокирован: проверка закрепления не прошла'
 }
 
 async function ack(request, status, newId, diagnostic = {}) {
@@ -172,23 +186,25 @@ export async function requestPreparation({ oldId, oldTitle, profile, title }) {
   const previous = context.storage.get('lastRequest', null) ??
     (latch?.token ? { requestId: latch.token, profile } : null)
   if (lastStatus?.oldId === oldId && lastStatus.status === 'failed') {
-    requireState(retryable && previous?.requestId === lastStatus.requestId && previous.profile === profile &&
-      safePendingLatch(latch, lastStatus, retryable), 'Previous handoff is not proven safe to retry')
+    requireState(retryable, RETRY_BLOCKED.retryable)
+    requireState(previous?.requestId === lastStatus.requestId && previous.profile === profile, RETRY_BLOCKED.reference)
+    requireState(safePendingLatch(latch, lastStatus, retryable), RETRY_BLOCKED.latchStatus)
     const route = await routeFor(profile)
     const inventory = await rows(route, profile)
     const old = exact(inventory, oldId)
     const titles = recordedTitles(lastStatus.title, latch?.title)
     const listings = []
     for (const title of titles) listings.push(await host.requestProfile(route, 'session.list', { title }))
-    requireState(old?.title === oldTitle && old.source === 'desktop' && old.profile === profile && old.pinned === true && old.archived === false &&
-      titles.every((title, i) => !inventory.some(row => row.title === title) &&
-        Array.isArray(listings[i].sessions) && listings[i].sessions.length === 0), 'Previous handoff changed; retry blocked')
+    requireState(old?.title === oldTitle && old.source === 'desktop' && old.profile === profile && old.pinned === true && old.archived === false, RETRY_BLOCKED.oldRow)
+    requireState(titles.every((title, i) => !inventory.some(row => row.title === title) &&
+      Array.isArray(listings[i].sessions) && listings[i].sessions.length === 0), RETRY_BLOCKED.latchTitle)
     const previousItem = await context.rest(`/request/${encodeURIComponent(previous.requestId)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
     // The fresh readback above is itself the server-side proof a legacy latch needs.
-    requireState(previousItem.requestId === previous.requestId && previousItem.profile === profile &&
-      previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
-      !previousItem.newId && safePendingLatch(context.storage.get(latchKey, null), previousItem, true) && previousItem.oldId === oldId &&
-      previousItem.oldTitle === oldTitle && previousItem.title === lastStatus.title, 'Previous request changed; retry blocked')
+    requireState(previousItem.requestId === previous.requestId && previousItem.profile === profile, RETRY_BLOCKED.reference)
+    requireState(previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
+      !previousItem.newId, RETRY_BLOCKED.readback)
+    requireState(safePendingLatch(context.storage.get(latchKey, null), previousItem, true), RETRY_BLOCKED.latchStatus)
+    requireState(previousItem.oldId === oldId && previousItem.oldTitle === oldTitle && previousItem.title === lastStatus.title, RETRY_BLOCKED.readback)
   }
   const requestId = crypto.randomUUID()
   const owner = host.state.focusedSessionOwner.get()
@@ -243,7 +259,7 @@ function HandoffChip() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [estimate, setEstimate] = useState(null)
-  const [update, setUpdate] = useState({ busy: false, message: null })
+  const [updateBusy, setUpdateBusy] = useState(false)
   const [, setProgressVersion] = useState(0)
   useEffect(() => {
     repaint = () => setProgressVersion(value => value + 1)
@@ -280,12 +296,14 @@ function HandoffChip() {
       requireState(old?.source === 'desktop' && old.profile === profile && old.archived === false, 'Focused chat is not a Desktop session')
       if (lastStatus?.oldId === expectedId && lastStatus.status === 'failed') {
         const latch = context.storage.get(`handoff:${profile}:${expectedId}`, null)
-        requireState(retryable && lastStatus.profile === profile && old.title === lastStatus.oldTitle && old.pinned === true &&
-          safePendingLatch(latch, lastStatus, retryable), 'Previous handoff is not proven safe to retry')
+        requireState(retryable, RETRY_BLOCKED.retryable)
+        requireState(lastStatus.profile === profile, RETRY_BLOCKED.reference)
+        requireState(old.title === lastStatus.oldTitle && old.pinned === true, RETRY_BLOCKED.oldRow)
+        requireState(safePendingLatch(latch, lastStatus, retryable), RETRY_BLOCKED.latchStatus)
         for (const title of recordedTitles(lastStatus.title, latch?.title)) {
           const found = await host.requestProfile(route, 'session.list', { title })
           requireState(!inventory.some(row => row.title === title) && Array.isArray(found.sessions) && found.sessions.length === 0,
-            'Previous handoff title exists; retry blocked')
+            RETRY_BLOCKED.latchTitle)
         }
       }
       if (host.state.focusedStoredSessionId.get() !== expectedId) return
@@ -307,16 +325,18 @@ function HandoffChip() {
 
   /** User-initiated refresh of the SERVER (Python) half only. The Desktop
    *  renderer copy cannot self-update — Возможности → Плагины remains the only
-   *  supported way, and the footer says so. */
+   *  supported way. Success is silent; a failure lands as one bounded line in
+   *  the popover's red error area. */
   async function onUpdateServer() {
-    setUpdate({ busy: true, message: null })
+    setUpdateBusy(true)
     try {
       const profile = host.state.focusedSessionOwner.get()?.profile
       requireState(profile, 'No focused Desktop chat')
-      const sha = await updateServerHalf(await routeFor(profile))
-      setUpdate({ busy: false, message: { ok: true, text: sha ? `Серверная часть обновлена (${sha}).` : 'Серверная часть обновлена.' } })
+      await updateServerHalf(await routeFor(profile))
+      setUpdateBusy(false)
     } catch (cause) {
-      setUpdate({ busy: false, message: { ok: false, text: `Не удалось обновить серверную часть: ${cause.message}` } })
+      setUpdateBusy(false)
+      setError(`Не удалось обновить серверную часть: ${cause.message}`)
     }
   }
 
@@ -342,18 +362,13 @@ function HandoffChip() {
         loading ? jsx('span', { children: 'Проверяю чат…' }) : null,
         proposal ? jsx(Input, { 'aria-label': 'Название нового чата', value: title, onChange: event => setTitle(event.target.value) }) : null,
         error ? jsx('span', { role: 'alert', style: { color: 'var(--ui-red)' }, children: error }) : null,
-        jsxs('div', { style: { display: 'flex', gap: 6, justifyContent: 'flex-end' }, children: [
-          jsx(Button, { type: 'button', variant: 'ghost', onClick: () => setOpen(false), children: 'Отмена' }),
-          jsx(Button, { type: 'button', disabled: !proposal || loading || busy, onClick: () => void move(), children: 'Переехать' })
-        ] }),
-        jsxs('div', { style: { borderTop: '1px solid var(--chrome-action-hover)', display: 'grid', gap: 6, paddingTop: 8 }, children: [
-          jsx('div', { style: { color: 'var(--ui-text-quaternary)' },
-            children: 'Обновляет только серверную (Python) часть плагина на сервере этого чата. Часть Desktop обновляется через Возможности → Плагины.' }),
-          jsxs('div', { style: { alignItems: 'center', display: 'flex', gap: 6, justifyContent: 'space-between' }, children: [
-            update.message ? jsx('span', { role: 'status', style: { color: update.message.ok ? 'var(--ui-text-tertiary)' : 'var(--ui-red)' }, children: update.message.text }) : null,
-            jsx(Button, { type: 'button', variant: 'ghost', disabled: update.busy || loading || busy || Boolean(pending) || inFlight,
-              title: 'git fetch и жёсткий reset в клоне плагина на сервере: только серверная (Python) часть',
-              onClick: () => void onUpdateServer(), children: update.busy ? 'Обновляю серверную часть…' : 'Обновить плагин на сервере' })
+        jsxs('div', { style: { alignItems: 'center', display: 'flex', gap: 6, justifyContent: 'space-between' }, children: [
+          jsx(Button, { type: 'button', variant: 'ghost', disabled: updateBusy || loading || busy || Boolean(pending) || inFlight,
+            title: 'Обновить серверную часть плагина',
+            onClick: () => void onUpdateServer(), children: updateBusy ? 'Обновляю…' : 'Обновить' }),
+          jsxs('div', { style: { display: 'flex', gap: 6 }, children: [
+            jsx(Button, { type: 'button', variant: 'ghost', onClick: () => setOpen(false), children: 'Отмена' }),
+            jsx(Button, { type: 'button', disabled: !proposal || loading || busy, onClick: () => void move(), children: 'Переехать' })
           ] })
         ] })
       ] })
@@ -490,8 +505,8 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
   if (priorLatch) {
     // Token equality is re-checked against the server readback below; a legacy
     // latch carries a random token, so here only the never-created shape gates.
-    requireState(pending.retryPrevious && priorLatch.status === 'pending' && !priorLatch.newId,
-    'Previous handoff exists; inspect its status before retry')
+    requireState(pending.retryPrevious, RETRY_BLOCKED.reference)
+    requireState(priorLatch.status === 'pending' && !priorLatch.newId, RETRY_BLOCKED.latchStatus)
   }
   inFlight = true
   try {
@@ -506,21 +521,22 @@ export async function runHandoff({ oldId, oldTitle, profile, title, handoff, req
     const found = await host.requestProfile(route, 'session.list', { title })
     requireState(Array.isArray(found.sessions) && found.sessions.length === 0, 'Title collision')
     if (priorLatch) {
-      requireState(old.pinned === true, 'Old session pin changed; retry blocked')
+      requireState(old.pinned === true, RETRY_BLOCKED.oldPin)
       // A legacy latch may record a different (or the only surviving) intended
       // title; when it differs from the typed one it must be absent too.
       if (priorLatch.title && priorLatch.title !== title) {
         const found = await host.requestProfile(route, 'session.list', { title: priorLatch.title })
         requireState(!list.some(row => row.title === priorLatch.title) && Array.isArray(found.sessions) && found.sessions.length === 0,
-          'Previous handoff title exists; retry blocked')
+          RETRY_BLOCKED.latchTitle)
       }
       const previousItem = await context.rest(`/request/${encodeURIComponent(pending.retryPrevious)}?profile=${encodeURIComponent(profile)}`, { timeoutMs: 8000 })
       // The fresh readback above is itself the server-side proof a legacy latch needs.
-      requireState(previousItem.requestId === pending.retryPrevious && previousItem.profile === profile &&
-        previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
-        !previousItem.newId && safePendingLatch(context.storage.get(key, null), previousItem, true) && previousItem.oldId === oldId &&
-        previousItem.oldTitle === oldTitle && (!previousItem.title || previousItem.title === title),
-      'Previous request changed; retry blocked')
+      requireState(previousItem.requestId === pending.retryPrevious && previousItem.profile === profile, RETRY_BLOCKED.reference)
+      requireState(previousItem.status === 'failed' && (previousItem.stage == null || previousItem.stage === 'claim') &&
+        !previousItem.newId, RETRY_BLOCKED.readback)
+      requireState(safePendingLatch(context.storage.get(key, null), previousItem, true), RETRY_BLOCKED.latchStatus)
+      requireState(previousItem.oldId === oldId && previousItem.oldTitle === oldTitle && (!previousItem.title || previousItem.title === title),
+        RETRY_BLOCKED.readback)
     }
     requireState(pending?.requestId === requestId, 'Preparation stopped before write')
     pending.phase = 'claiming'

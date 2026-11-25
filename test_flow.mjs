@@ -68,6 +68,72 @@ function findButton(f, label) {
   throw new Error(`Button «${label}» not found`)
 }
 
+const tick = () => new Promise(resolve => setImmediate(resolve))
+
+// Bounded retry-gate diagnostics: one short Russian line per failed check.
+const M = {
+  retryable: 'Повтор заблокирован: проверка повторяемости не прошла',
+  reference: 'Повтор заблокирован: проверка ссылки на заявку не прошла',
+  latch: 'Повтор заблокирован: проверка локальной записи не прошла',
+  title: 'Повтор заблокирован: проверка записанного названия не прошла',
+  readback: 'Повтор заблокирован: проверка данных сервера не прошла',
+  oldRow: 'Повтор заблокирован: проверка старого чата не прошла',
+  oldPin: 'Повтор заблокирован: проверка закрепления не прошла'
+}
+
+function findAlert(f, text) {
+  const stack = [f.render()]
+  while (stack.length) {
+    const node = stack.shift()
+    const label = Array.isArray(node?.props?.children) ? node.props.children.join('') : node?.props?.children
+    if (node?.props?.role === 'alert' && String(label).includes(text)) return node
+    const kids = Array.isArray(node?.props?.children) ? node.props.children : node?.props?.children ? [node.props.children] : []
+    stack.push(...kids.filter(kid => kid && typeof kid === 'object'))
+  }
+  throw new Error(`alert with «${text}» not found`)
+}
+
+function buttonsUnder(node, depth = 2, acc = []) {
+  if (node?.type === 'Button') { acc.push(node); return acc }
+  const kids = Array.isArray(node?.props?.children) ? node.props.children : node?.props?.children ? [node.props.children] : []
+  if (depth > 0) for (const kid of kids) buttonsUnder(kid, depth - 1, acc)
+  return acc
+}
+
+// The update button by its stable tooltip, whatever its current label.
+function findUpdateButton(f) {
+  const stack = [f.render().props.children[1].props.children]
+  while (stack.length) {
+    const node = stack.shift()
+    if (node?.type === 'Button' && node.props.title === 'Обновить серверную часть плагина') return node
+    const kids = Array.isArray(node?.props?.children) ? node.props.children : node?.props?.children ? [node.props.children] : []
+    stack.push(...kids.filter(kid => kid && typeof kid === 'object'))
+  }
+  throw new Error('update button not found')
+}
+
+// The single actions row holding Обновить (left) + Отмена/Переехать (right).
+function findActionsRow(f) {
+  const stack = [f.render().props.children[1].props.children]
+  while (stack.length) {
+    const node = stack.shift()
+    const labels = buttonsUnder(node).map(button => button.props.children)
+    if (labels.join('|') === 'Обновить|Отмена|Переехать') return node
+    const kids = Array.isArray(node?.props?.children) ? node.props.children : []
+    stack.push(...kids.filter(kid => kid && typeof kid === 'object'))
+  }
+  throw new Error('actions row Обновить|Отмена|Переехать not found')
+}
+
+// Failed no-write request whose refresh already proved the retry safe.
+async function retryableFixture() {
+  const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', stage: null, reason: null, newId: null }]])
+  const storage = new Map([['lastRequest', { requestId: 'failed-old', profile: 'default' }]])
+  const f = await fixture({ mailbox, storage })
+  await f.mod.refreshStatus()
+  return f
+}
+
 async function approve(f) {
   await f.render().props.onOpenChange(true)
   await new Promise(resolve => setImmediate(resolve))
@@ -448,30 +514,52 @@ test('update result parsing keeps a short hash or one bounded single-line reason
   assert.deepEqual(f.mod.parseUpdateResult({ stdout: '' }), { ok: false, sha: null, error: 'код выхода ?' })
 })
 
-test('popover footer update button refreshes only the server half and shows the short hash', async () => {
+test('update button sits left in the actions row with an honest tooltip and no disclaimer', async () => {
+  const f = await fixture()
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  const row = findActionsRow(f)
+  assert.equal(row.props.style.display, 'flex')
+  assert.equal(row.props.style.justifyContent, 'space-between')
+  assert.deepEqual(buttonsUnder(row).map(button => button.props.children), ['Обновить', 'Отмена', 'Переехать'])
+  const update = findButton(f, 'Обновить')
+  assert.equal(update.props.variant, 'ghost')
+  assert.equal(update.props.title, 'Обновить серверную часть плагина')
+  const dom = JSON.stringify(f.render())
+  assert.doesNotMatch(dom, /Возможности → Плагины/)
+  assert.doesNotMatch(dom, /серверную \(Python\) часть/)
+  assert.doesNotMatch(dom, /Обновляет только серверную/)
+  assert.equal(dom.includes('"role":"status"'), false)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('update refreshes only the server half, disables while running, stays silent on success', async () => {
   const f = await fixture()
   await f.render().props.onOpenChange(true)
   await new Promise(resolve => setImmediate(resolve))
   const commands = []
+  let release
   const original = f.host.requestProfile
   f.host.requestProfile = async (route, method, params, timeoutMs) => {
     if (method === 'shell.exec') {
       commands.push({ command: params.command, session_id: params.session_id, timeoutMs })
-      return /%COMSPEC%/.test(params.command) ? { code: 0, stdout: '%COMSPEC%' } : { code: 0, stdout: 'abc1234\n' }
+      if (/%COMSPEC%/.test(params.command)) return { code: 0, stdout: '%COMSPEC%' }
+      await new Promise(resolve => { release = resolve })
+      return { code: 0, stdout: 'abc1234\n' }
     }
     return original(route, method, params, timeoutMs)
   }
-  await findButton(f, 'Обновить плагин на сервере').props.onClick()
-  for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('abc1234'); i++) await new Promise(resolve => setImmediate(resolve))
-  const updateCommands = commands.filter(c => !/%COMSPEC%/.test(c.command))
-  assert.equal(updateCommands.length, 1, JSON.stringify(commands))
-  assert.match(updateCommands[0].command, /git reset -q --hard FETCH_HEAD/)
-  assert.equal(updateCommands[0].session_id, undefined)
-  assert.equal(updateCommands[0].timeoutMs, 40000)
+  await findButton(f, 'Обновить').props.onClick()
+  for (let i = 0; i < 20 && !release; i++) await tick()
+  assert.equal(findUpdateButton(f).props.disabled, true)
+  release()
+  for (let i = 0; i < 5; i++) await tick()
+  assert.deepEqual(commands, [{ command: f.mod.updateCommandFor(false), session_id: undefined, timeoutMs: 40000 }])
   const dom = JSON.stringify(f.render())
-  assert.match(dom, /Серверная часть обновлена \(abc1234\)/)
-  assert.match(dom, /серверную \(Python\) часть/)
-  assert.match(dom, /Возможности → Плагины/)
+  assert.doesNotMatch(dom, /Серверная часть обновлена/)
+  assert.equal(dom.includes('"role":"status"'), false)
+  assert.equal(findUpdateButton(f).props.disabled, false)
+  assert.equal(f.calls.some(c => c[0] === 'notify'), false)
   assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
 })
 
@@ -490,10 +578,12 @@ test('update command follows a detected Windows server through the COMSPEC probe
     }
     return original(route, method, params)
   }
-  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  await findButton(f, 'Обновить').props.onClick()
   for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('deadbee'); i++) await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(commands, ['echo %COMSPEC%', f.mod.updateCommandFor(true)])
-  assert.match(JSON.stringify(f.render()), /Серверная часть обновлена \(deadbee\)/)
+  const dom = JSON.stringify(f.render())
+  assert.doesNotMatch(dom, /Серверная часть обновлена/)
+  assert.equal(findButton(f, 'Обновить').props.disabled, false)
 })
 
 test('failed server update shows a bounded reason without a raw stack', async () => {
@@ -507,13 +597,13 @@ test('failed server update shows a bounded reason without a raw stack', async ()
     }
     return original(route, method, params)
   }
-  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  await findButton(f, 'Обновить').props.onClick()
   for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('Не удалось'); i++) await new Promise(resolve => setImmediate(resolve))
+  const alert = findAlert(f, 'Не удалось обновить серверную часть: fatal: cannot lock ref')
+  assert.equal(alert.props.style.color, 'var(--ui-red)')
   const dom = JSON.stringify(f.render())
-  assert.match(dom, /Не удалось обновить серверную часть/)
-  assert.match(dom, /fatal: cannot lock ref/)
   assert.doesNotMatch(dom, /at Object|at process/)
-  assert.ok(findButton(f, 'Обновить плагин на сервере'))
+  assert.equal(findButton(f, 'Обновить').props.disabled, false)
   assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
 })
 
@@ -531,10 +621,12 @@ test('gateway that rejects an extra session_id still updates via the command alo
     }
     return original(route, method, params, timeoutMs)
   }
-  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  await findButton(f, 'Обновить').props.onClick()
   for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('abc1234'); i++) await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(attempts, [{ session_id: undefined, timeoutMs: 40000 }])
-  assert.match(JSON.stringify(f.render()), /Серверная часть обновлена \(abc1234\)/)
+  const dom = JSON.stringify(f.render())
+  assert.doesNotMatch(dom, /Серверная часть обновлена/)
+  assert.equal(findButton(f, 'Обновить').props.disabled, false)
   assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
 })
 
@@ -552,10 +644,12 @@ test('gateway that requires session_id gets the focused runtime id on the bounde
     }
     return original(route, method, params, timeoutMs)
   }
-  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  await findButton(f, 'Обновить').props.onClick()
   for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('deadbee'); i++) await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(attempts, [null, 'runtime-old'])
-  assert.match(JSON.stringify(f.render()), /Серверная часть обновлена \(deadbee\)/)
+  const dom = JSON.stringify(f.render())
+  assert.doesNotMatch(dom, /Серверная часть обновлена/)
+  assert.equal(findButton(f, 'Обновить').props.disabled, false)
 })
 
 test('session_id adaptation stays bounded at three attempts with one honest line', async () => {
@@ -572,7 +666,7 @@ test('session_id adaptation stays bounded at three attempts with one honest line
     }
     return original(route, method, params)
   }
-  await findButton(f, 'Обновить плагин на сервере').props.onClick()
+  await findButton(f, 'Обновить').props.onClick()
   for (let i = 0; i < 20 && !JSON.stringify(f.render()).includes('Не удалось'); i++) await new Promise(resolve => setImmediate(resolve))
   assert.equal(attempts, 3)
   const dom = JSON.stringify(f.render())
@@ -581,4 +675,98 @@ test('session_id adaptation stays bounded at three attempts with one honest line
   assert.doesNotMatch(dom, /at Object|at process|at async/)
   assert.equal(dom.includes('\\n'), false)
   assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('retry gates speak specific bounded Russian instead of one generic line', async () => {
+  const source = await fs.readFile(new URL('./desktop/plugin.js', import.meta.url), 'utf8')
+  for (const gone of ['Previous handoff is not proven safe to retry', 'Previous handoff changed; retry blocked',
+    'Previous request changed; retry blocked', 'Previous handoff exists; inspect its status before retry',
+    'Previous handoff title exists; retry blocked']) {
+    assert.equal(source.includes(gone), false, `generic message still present: ${gone}`)
+  }
+  const bounded = [...source.matchAll(/'(Повтор заблокирован: [^']+)'/g)].map(match => match[1])
+  assert.ok(bounded.length >= 7, `expected 7 bounded messages, found ${bounded.length}`)
+  for (const message of bounded) {
+    assert.ok(message.length <= 60, `too long (${message.length}): ${message}`)
+    assert.match(message, /^Повтор заблокирован: проверка [а-яё ]+ не прошла$/, message)
+  }
+})
+
+test('requestPreparation gate names unproven retry when retryable is false', async () => {
+  const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', stage: 'create', reason: 'operation_failed', newId: null }]])
+  const storage = new Map([['lastRequest', { requestId: 'failed-old', profile: 'default' }]])
+  const f = await fixture({ mailbox, storage })
+  await f.mod.refreshStatus()
+  await assert.rejects(f.mod.requestPreparation({ oldId: 'old', oldTitle: 'Старый чат', profile: 'default', title: 'Старый чат 2' }),
+    error => error.message === M.retryable)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('requestPreparation gate names reference mismatch when lastRequest drifted', async () => {
+  const f = await retryableFixture()
+  f.storage.set('lastRequest', { requestId: 'other', profile: 'default' })
+  await assert.rejects(f.mod.requestPreparation({ oldId: 'old', oldTitle: 'Старый чат', profile: 'default', title: 'Старый чат 2' }),
+    error => error.message === M.reference)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('requestPreparation gate names latch status when the latch changed after refresh', async () => {
+  const f = await retryableFixture()
+  f.storage.set('handoff:default:old', { token: 'failed-old', status: 'created', title: 'Старый чат 2' })
+  await assert.rejects(f.mod.requestPreparation({ oldId: 'old', oldTitle: 'Старый чат', profile: 'default', title: 'Старый чат 2' }),
+    error => error.message === M.latch)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('requestPreparation gate names the recorded title when it appears before approval', async () => {
+  const f = await retryableFixture()
+  f.rows.push({ id: 'partial', title: 'Старый чат 2', source: 'desktop', profile: 'default', archived: false, pinned: false })
+  await assert.rejects(f.mod.requestPreparation({ oldId: 'old', oldTitle: 'Старый чат', profile: 'default', title: 'Старый чат 2' }),
+    error => error.message === M.title)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('requestPreparation gate names the server readback when the request changed after refresh', async () => {
+  const f = await retryableFixture()
+  f.mailbox.get('failed-old').stage = 'create'
+  await assert.rejects(f.mod.requestPreparation({ oldId: 'old', oldTitle: 'Старый чат', profile: 'default', title: 'Старый чат 2' }),
+    error => error.message === M.readback)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('open gate names old-chat drift in the popover error', async () => {
+  const f = await retryableFixture()
+  f.rows[0].title = 'Переименованный чат'
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  const dom = JSON.stringify(f.render())
+  assert.match(dom, /Повтор заблокирован: проверка старого чата не прошла/)
+  assert.doesNotMatch(dom, /Previous handoff/)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('open gate names latch status when the latch changed after refresh', async () => {
+  const f = await retryableFixture()
+  f.storage.set('handoff:default:old', { token: 'failed-old', status: 'verified', title: 'Старый чат 2' })
+  await f.render().props.onOpenChange(true)
+  await new Promise(resolve => setImmediate(resolve))
+  const dom = JSON.stringify(f.render())
+  assert.match(dom, /Повтор заблокирован: проверка локальной записи не прошла/)
+  assert.doesNotMatch(dom, /Previous handoff/)
+  assert.equal(f.calls.some(c => c[0] === 'composer.submit' || c[0] === 'session.create'), false)
+})
+
+test('run gate names latch status when the latch gains newId after approval', async () => {
+  const mailbox = new Map([['failed-old', { requestId: 'failed-old', profile: 'default', oldId: 'old', oldTitle: 'Старый чат', title: 'Старый чат 2', status: 'failed', stage: null, reason: null, newId: null }]])
+  const storage = new Map([['lastRequest', { requestId: 'failed-old', profile: 'default' }],
+    ['handoff:default:old', { token: 'failed-old', status: 'pending', title: 'Старый чат 2' }]])
+  const f = await fixture({ mailbox, storage })
+  await f.mod.refreshStatus()
+  await approve(f)
+  await new Promise(resolve => setImmediate(resolve))
+  f.storage.set('handoff:default:old', { token: 'failed-old', status: 'pending', title: 'Старый чат 2', newId: 'ghost' })
+  await f.fire(f.payload())
+  assert.equal(f.calls.some(c => c[0] === 'session.create'), false)
+  assert.ok(f.calls.some(c => c[0] === 'notify' && c[1].kind === 'error' && c[1].message.includes(M.latch)),
+    JSON.stringify(f.calls.filter(c => c[0] === 'notify')))
 })
